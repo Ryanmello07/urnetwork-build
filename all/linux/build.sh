@@ -8,6 +8,7 @@
 # "Artifact filenames"; run.sh globs for exactly these):
 #   urnetwork-daemon_<version>_<arch>.deb
 #   urnetwork-daemon-<version>-<arch>.install.tar.gz
+#   urnetwork-daemon-<version>.<rpmarch>.rpm  (rpmarch = x86_64|aarch64)
 #   URnetwork-<version>-<arch>.AppImage  (+ .AppImage.zsync)
 #
 # The heavy lifting happens inside the container: build-arch.sh (mounted in)
@@ -30,6 +31,9 @@
 #   UR_GLIBC_FLOOR    daemon glibc floor (default 2.35); must match the
 #                     `Depends: libc6 (>= x)` in linux/packaging/deb/nfpm.yaml
 #   UR_GLIBC_CEILING  the AppImage's own glibc gate (default: UR_GLIBC_FLOOR)
+#   UR_REQUIRE_RPM    make a missing/failed .rpm fatal (default false: warn and
+#                     carry on, so a bad rpm never costs the release the .deb,
+#                     the tarball or the AppImage — see build-arch.sh's header)
 #   UR_SKIP_VERIFY=1  build + package only, skip the verification stage
 #
 # SPDX-License-Identifier: MPL-2.0
@@ -78,7 +82,7 @@ fi
 # Clear any stale artifacts of the types we produce, so a partial rebuild can
 # never hand old files to the uploader. (Once per run, NOT per arch — the first
 # arch's output must survive the second arch's pass.)
-rm -f "${OUT_DIR}/"*.deb "${OUT_DIR}/"*.install.tar.gz \
+rm -f "${OUT_DIR}/"*.deb "${OUT_DIR}/"*.install.tar.gz "${OUT_DIR}/"*.rpm \
       "${OUT_DIR}/"*.AppImage "${OUT_DIR}/"*.AppImage.zsync
 
 for arch in ${ARCHES}; do
@@ -101,6 +105,7 @@ for arch in ${ARCHES}; do
       -v "${here}/verify.sh:/verify.sh:ro" \
       -e ARCH="${arch}" -e VERSION="${VERSION}" -e ROLE="${role}" \
       -e UR_GLIBC_FLOOR -e UR_GLIBC_CEILING -e UR_SKIP_VERIFY \
+      -e UR_REQUIRE_RPM \
       "${image_base}-${role}:${arch}" \
       bash /build-arch.sh
   done
@@ -118,11 +123,35 @@ for arch in ${ARCHES}; do
       exit 1
     fi
   done
+
+  # The .rpm is checked separately and NON-FATALLY: it is the one artifact here
+  # that is not (yet) a release contract, and build-arch.sh already tolerates a
+  # failed rpm per-artifact so the four names above survive it. Making it fatal
+  # at this level would undo that — run.sh's uploads all live inside the `then`
+  # branch of one `if build-linux.sh`, so any non-zero exit from this script
+  # skips EVERY linux asset, SDK zip included. Loud, then, rather than fatal.
+  case "${arch}" in
+    amd64) rpm_arch=x86_64 ;;
+    arm64) rpm_arch=aarch64 ;;
+    *)     rpm_arch='' ;;
+  esac
+  rpm_name="urnetwork-daemon-${VERSION}.${rpm_arch}.rpm"
+  if [ -n "${rpm_arch}" ] && [ -f "${OUT_DIR}/${rpm_name}" ]; then
+    : # present, nothing to say — the summary below lists it
+  elif [ "${UR_REQUIRE_RPM:-false}" = true ]; then
+    echo "ERROR: no ${rpm_name} after the ${arch} build and UR_REQUIRE_RPM=true" >&2
+    exit 1
+  else
+    echo "WARNING: no .rpm for ${arch} (expected ${rpm_name}) — the release will" >&2
+    echo "         ship without it. build-arch.sh logged the reason above;" >&2
+    echo "         UR_REQUIRE_RPM=true makes this fatal instead." >&2
+  fi
+
   echo ">>> ${arch} artifacts OK"
 done
 
 echo ">>> linux artifacts built:"
-for f in "${OUT_DIR}"/*.deb "${OUT_DIR}"/*.install.tar.gz \
+for f in "${OUT_DIR}"/*.deb "${OUT_DIR}"/*.install.tar.gz "${OUT_DIR}"/*.rpm \
          "${OUT_DIR}"/*.AppImage "${OUT_DIR}"/*.AppImage.zsync; do
   if [ -f "$f" ]; then echo "    $(basename "$f")"; fi
 done

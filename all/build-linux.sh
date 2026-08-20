@@ -4,6 +4,7 @@
 # (amd64 + arm64, Ubuntu 24.04 container via linux/build.sh):
 #   urnetwork-daemon_<version>_<arch>.deb
 #   urnetwork-daemon-<version>-<arch>.install.tar.gz
+#   urnetwork-daemon-<version>.<rpmarch>.rpm (rpmarch = x86_64|aarch64)
 #   URnetwork-<version>-<arch>.AppImage (+ .AppImage.zsync)
 #
 # This is the linux build part of run.sh, extracted so it can also run
@@ -18,11 +19,13 @@
 #                          from the v<version> branch of $BUILD_HOME/linux)
 #   WARP_VERSION           internal version, e.g. 2026.7.6+985989570 (default:
 #                          EXTERNAL_WARP_VERSION with the last '-' as a '+')
-#   OUT_DIR                where the deb/tarball/AppImage artifacts land;
+#   OUT_DIR                where the deb/tarball/rpm/AppImage artifacts land;
 #                          existing ones in it are removed so the caller never
 #                          picks up stale ones
 #                          (default: ${BUILD_OUT:-$BUILD_HOME/out}/desktop/linux)
 #   ARCHES                 forwarded to linux/build.sh (default "amd64 arm64")
+#   UR_REQUIRE_RPM         forwarded: make a missing/failed .rpm fatal
+#                          (default false — warn and carry on)
 #
 # SPDX-License-Identifier: MPL-2.0
 set -euo pipefail
@@ -91,6 +94,31 @@ for _p in packaging/make-deb.sh packaging/make-install-tarball.sh packaging/make
   exit 1
 done
 
+# make-rpm.sh is preflighted here too, but SOFTLY — deliberately unlike the
+# three above. It is the newest script in linux/packaging, so a checkout that
+# legitimately predates it must still produce the artifacts it does have. The
+# asymmetry matters because of where run.sh's uploads sit: they are all inside
+# the `then` branch of one `if build-linux.sh`, so a hard exit here would cost
+# the release its .deb, its tarball, its AppImage AND the SDK zip over one
+# missing file. UR_REQUIRE_RPM=true restores the gate, which is what the linux
+# repo's own CI runs with.
+if [ ! -f "$BUILD_HOME/linux/packaging/make-rpm.sh" ]; then
+  if [ "${UR_REQUIRE_RPM:-false}" = true ]; then
+    {
+      echo "ERROR: $BUILD_HOME/linux/packaging/make-rpm.sh is missing and UR_REQUIRE_RPM=true."
+      echo "       Same cause as the block above: this pipeline builds \$BUILD_HOME/linux,"
+      echo "       a release-staged checkout, NOT your working tree — see SRC_HOME/SRC_LINUX."
+    } >&2
+    exit 1
+  fi
+  {
+    echo "WARNING: $BUILD_HOME/linux/packaging/make-rpm.sh is missing — this build will"
+    echo "         produce no .rpm. (Same staging caveat as above: \$BUILD_HOME/linux is a"
+    echo "         release-staged checkout, not your working tree.)"
+    echo "         Set UR_REQUIRE_RPM=true to make this fatal instead."
+  } >&2
+fi
+
 OUT_DIR="${OUT_DIR:-${BUILD_OUT:-$BUILD_HOME/out}/desktop/linux}"
 mkdir -p "$OUT_DIR"
 # Clear stale artifacts of every type this build produces (run.sh globs OUT_DIR
@@ -101,7 +129,7 @@ mkdir -p "$OUT_DIR"
 # orphaned checksum that no longer matches any artifact is worse than none.
 # Also sweeps *.snap — nothing produces those since the AppImage migration, but
 # a pre-migration tree still has them sitting next to the real artifacts.
-rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.install.tar.gz \
+rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.install.tar.gz "$OUT_DIR"/*.rpm \
       "$OUT_DIR"/*.AppImage "$OUT_DIR"/*.AppImage.zsync \
       "$OUT_DIR"/*.sha256 "$OUT_DIR"/*.asc \
       "$OUT_DIR"/*.snap
@@ -141,10 +169,12 @@ for a in amd64 arm64; do
   [ -f "$so" ] || { echo "ERROR: $so not built — is the linux cross toolchain installed? (cd sdk/cgo && make init)" >&2; exit 1; }
 done
 
-# Deb + install tarball + AppImage — built per arch in the Ubuntu 24.04
-# container (meson build + the linux repo's packaging scripts); arm64 native,
-# amd64 under qemu emulation. See linux/README.md.
-echo ">>> building the linux deb/tarball/AppImage artifacts ($EXTERNAL_WARP_VERSION)"
+# Deb + install tarball + rpm + AppImage — built per arch in the Ubuntu
+# containers (meson build + the linux repo's packaging scripts); arm64 native,
+# amd64 under qemu emulation. The .deb, the tarball and the .rpm all come out
+# of the same staging tree in the same ROLE=daemon container, so they cannot
+# ship different daemons. See linux/README.md.
+echo ">>> building the linux deb/tarball/rpm/AppImage artifacts ($EXTERNAL_WARP_VERSION)"
 LINUX_DIR="$BUILD_HOME/linux" \
 SDK_ZIP="$BUILD_HOME/sdk/cgo/build/URnetworkSdkLinux.zip" \
 OUT_DIR="$OUT_DIR" \
