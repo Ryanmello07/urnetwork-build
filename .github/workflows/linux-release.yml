@@ -283,6 +283,7 @@ jobs:
           shopt -s nullglob
           files=(
             urnetwork-daemon-*.install.tar.gz
+            urnetwork-daemon-*.pkg.tar.zst
             urnetwork-daemon_*.deb
             URnetwork-*.AppImage
             URnetwork-*.AppImage.zsync
