@@ -24,8 +24,27 @@
 #                          picks up stale ones
 #                          (default: ${BUILD_OUT:-$BUILD_HOME/out}/desktop/linux)
 #   ARCHES                 forwarded to linux/build.sh (default "amd64 arm64")
+#   ROLES                  forwarded to linux/build.sh: which halves to build,
+#                          subset of "daemon gui" (default both). See that
+#                          script's header — it is what lets a CI run the two
+#                          halves as separate jobs.
 #   UR_REQUIRE_RPM         forwarded: make a missing/failed .rpm fatal
 #                          (default false — warn and carry on)
+#   UR_SKIP_SDK_BUILD      1 = the cgo SDK output is ALREADY in
+#                          sdk/cgo/build/ (linux/<arch>/libURnetworkSdk.so +
+#                          URnetworkSdkLinux.zip); do not rebuild it. Default
+#                          0 — the release host always builds it here.
+#
+#                          It exists for CI (build/.github/workflows/
+#                          linux-release.yml), which builds the SDK ONCE in a
+#                          shared job and hands the zip to every (role, arch)
+#                          leg: four legs rebuilding a byte-identical .so would
+#                          each need Go, the zig cross toolchain and the 253 MB
+#                          sdk submodule, for ~2 minutes of duplicated work.
+#                          The output assertions below still run either way,
+#                          and THEY are what gates the packaging step — a
+#                          skipped build with nothing staged fails exactly as a
+#                          failed build does.
 #
 # SPDX-License-Identifier: MPL-2.0
 set -euo pipefail
@@ -143,7 +162,15 @@ rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.install.tar.gz "$OUT_DIR"/*.rpm \
 # of here — so a build can never silently move a dependency version, and the
 # artifact always corresponds to the tree as given. Check and fail with the
 # command to run; do not run it.
-if [ ! -f "$BUILD_HOME/sdk/cgo/go.sum" ]; then
+#
+# UR_SKIP_SDK_BUILD=1 short-circuits the gate TOGETHER WITH the build, and that
+# pairing is deliberate: with nothing to compile there is no module graph to
+# prepare, and demanding go.sum anyway would force every CI leg to check out the
+# 253 MB sdk submodule for a file it never opens.
+if [ "${UR_SKIP_SDK_BUILD:-0}" = 1 ]; then
+  echo ">>> UR_SKIP_SDK_BUILD=1 — using the sdk/cgo/build output already staged"
+  echo "    (the per-arch .so and zip assertions below still run)"
+elif [ ! -f "$BUILD_HOME/sdk/cgo/go.sum" ]; then
   {
     echo "ERROR: $BUILD_HOME/sdk/cgo/go.sum is missing."
     echo "       It is git-ignored and generated, normally by run.sh's version"
@@ -156,18 +183,37 @@ if [ ! -f "$BUILD_HOME/sdk/cgo/go.sum" ]; then
     echo "       upgrades indirect deps (quic-go, gvisor, x/crypto, …)."
   } >&2
   exit 1
+else
+  echo ">>> building the linux cgo sdk ($WARP_VERSION)"
+  (cd "$BUILD_HOME/sdk/cgo" && WARP_VERSION="$WARP_VERSION" make build_linux)
 fi
-
-echo ">>> building the linux cgo sdk ($WARP_VERSION)"
-(cd "$BUILD_HOME/sdk/cgo" && WARP_VERSION="$WARP_VERSION" make build_linux)
 
 # make chains recipe commands with ';', so a failed cross-compile does not stop
 # the zip step — verify both .so's exist before feeding the packaging build (a
 # partial zip would otherwise sail through to broken artifacts).
 for a in amd64 arm64; do
   so="$BUILD_HOME/sdk/cgo/build/linux/$a/libURnetworkSdk.so"
-  [ -f "$so" ] || { echo "ERROR: $so not built — is the linux cross toolchain installed? (cd sdk/cgo && make init)" >&2; exit 1; }
+  if [ ! -f "$so" ]; then
+    echo "ERROR: $so not built." >&2
+    if [ "${UR_SKIP_SDK_BUILD:-0}" = 1 ]; then
+      echo "       UR_SKIP_SDK_BUILD=1, so nothing here built it: whatever staged" >&2
+      echo "       sdk/cgo/build did not produce this arch. Check the job that did." >&2
+    else
+      echo "       Is the linux cross toolchain installed? (cd sdk/cgo && make init)" >&2
+    fi
+    exit 1
+  fi
 done
+
+# The zip is the LAST command in the same ';'-chained recipe, so it can fail
+# while every .so above succeeds and make still exits 0 — and it, not the .so
+# files, is what build.sh actually hands to fetch-deps.sh. Assert it for the
+# same reason the loop above exists.
+SDK_ZIP="$BUILD_HOME/sdk/cgo/build/URnetworkSdkLinux.zip"
+if [ ! -s "$SDK_ZIP" ]; then
+  echo "ERROR: $SDK_ZIP is missing or empty — the sdk zip step did not run" >&2
+  exit 1
+fi
 
 # Deb + install tarball + rpm + AppImage — built per arch in the Ubuntu
 # containers (meson build + the linux repo's packaging scripts); arm64 native,
@@ -176,7 +222,7 @@ done
 # ship different daemons. See linux/README.md.
 echo ">>> building the linux deb/tarball/rpm/AppImage artifacts ($EXTERNAL_WARP_VERSION)"
 LINUX_DIR="$BUILD_HOME/linux" \
-SDK_ZIP="$BUILD_HOME/sdk/cgo/build/URnetworkSdkLinux.zip" \
+SDK_ZIP="$SDK_ZIP" \
 OUT_DIR="$OUT_DIR" \
 VERSION="$EXTERNAL_WARP_VERSION" \
     "$here/linux/build.sh"

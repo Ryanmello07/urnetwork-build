@@ -1,0 +1,311 @@
+# Cut a Linux release from THIS FORK. FORK-ONLY, DELIBERATELY.
+#
+# urnetwork/build does not get a release workflow and should never be sent one:
+# upstream runs its real builds on dedicated servers, and all/run.sh remains the
+# release path for the official repo. Adding a second publisher there would mean
+# the official repo could release from two places. What DOES belong upstream is
+# the build-and-test half, which lives in linux-build.yml and is written to be
+# contributed.
+#
+# So this file adds exactly one thing on top of that workflow: the publishing.
+# It calls linux-build.yml rather than restating it, so there is one definition
+# of how the Linux leg is built and no chance of the two drifting.
+#
+# The purpose of this release is to MIRROR upstream's release set -- the same
+# artifacts under the same names -- so the app's updater, which matches release
+# assets by filename suffix, behaves identically on the beta and upstream
+# channels. A naming divergence here silently breaks the updater on one of them.
+#
+# SPDX-License-Identifier: MPL-2.0
+name: Linux release (fork)
+
+# Manual only. A release is a deliberate act, and there is no push or schedule
+# trigger that could make one happen by accident.
+on:
+  workflow_dispatch:
+    inputs:
+      arches:
+        description: "Architectures to build"
+        type: choice
+        default: "amd64 arm64"
+        options: ["amd64 arm64", "amd64", "arm64"]
+      require_rpm:
+        description: "Gate the release on the .rpm"
+        type: boolean
+        default: true
+      version:
+        description: "Release version, e.g. 2026.8.20-1024590520. Empty = derive one."
+        type: string
+        default: ""
+      linux_repo:
+        description: "owner/repo for the linux tree (only used when linux_ref is set)"
+        type: string
+        default: "urnetwork/linux"
+      linux_ref:
+        description: "Branch/tag/sha for the linux tree. Empty = the submodule pin."
+        type: string
+        default: ""
+      sdk_repo:
+        description: "owner/repo for the sdk tree (only used when sdk_ref is set)"
+        type: string
+        default: "urnetwork/sdk"
+      sdk_ref:
+        description: "Branch/tag/sha for the sdk tree. Empty = the submodule pin."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  # The whole build, reused verbatim. ROLES is pinned to both halves because a
+  # release without one of them is not a release -- linux-build.yml's own publish
+  # switch refuses to set publish=true for a partial set, so this is belt and
+  # braces with that.
+  build:
+    uses: ./.github/workflows/linux-build.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      mode: release
+      arches: ${{ inputs.arches }}
+      roles: "daemon gui"
+      require_rpm: ${{ inputs.require_rpm && 'true' || 'false' }}
+      version: ${{ inputs.version }}
+      linux_repo: ${{ inputs.linux_repo }}
+      linux_ref: ${{ inputs.linux_ref }}
+      sdk_repo: ${{ inputs.sdk_repo }}
+      sdk_ref: ${{ inputs.sdk_ref }}
+
+  release:
+    name: Publish the release
+    needs: [build]
+    # No status function in this expression, so the implicit "all needs
+    # succeeded" gate still applies — a red leg skips this job. The step below
+    # asserts that anyway, because "I believe this is implicit" is exactly the
+    # kind of belief that publishes half a release.
+    if: ${{ needs.build.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      ARCHES: ${{ needs.build.outputs.arches }}
+      ROLES: ${{ needs.build.outputs.roles }}
+      REQUIRE_RPM: ${{ needs.build.outputs.require_rpm }}
+      SDK_SOURCE: ${{ needs.build.outputs.sdk_source }}
+      LINUX_SOURCE: ${{ needs.build.outputs.linux_source }}
+      BUILD_RESULT: ${{ needs.build.result }}
+    steps:
+      - name: Assert the build actually succeeded
+        # The `if:` above has no status function, so the implicit "needs succeeded"
+        # gate already applies. This asserts it anyway: "I believe this is
+        # implicit" is exactly the belief that publishes half a release. One
+        # check, not three -- the plan/sdk/build legs are now jobs INSIDE the
+        # called workflow, and a reusable workflow reports success only when
+        # every job in it succeeded.
+        run: |
+          set -euo pipefail
+          echo "build -> $BUILD_RESULT"
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::the build workflow did not succeed ($BUILD_RESULT) -- refusing to publish a partial set"
+            exit 1
+          fi
+
+      # gh resolves which repository to release into from the checkout's
+      # remote, so this has to be a real checkout even though nothing is built.
+      - name: Check out the build repo
+        uses: actions/checkout@v4
+
+      - name: Download the SDK zip
+        uses: actions/download-artifact@v4
+        with:
+          name: urnetwork-sdk-linux
+          path: sdk-zip
+
+      - name: Download every build leg's artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: urnetwork-build-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Name the SDK zip the way run.sh names it
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv sdk-zip/URnetworkSdkLinux.zip "dist/URnetworkSdkLinux-${VERSION}.zip"
+          ls -la dist
+
+      # BEFORE the release is touched. Publishing deletes the tag's existing
+      # release and recreates it; a missing asset discovered after the delete
+      # would leave the tag with no release at all.
+      - name: Assert the asset set
+        working-directory: dist
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          read -r -a arch_arr <<<"$ARCHES"
+          n_arch="${#arch_arr[@]}"
+          tarballs=(urnetwork-daemon-*.install.tar.gz)
+          debs=(urnetwork-daemon_*.deb)
+          appimages=(URnetwork-*.AppImage)
+          zsyncs=(URnetwork-*.AppImage.zsync)
+          sdkzips=(URnetworkSdkLinux-*.zip)
+          # Binary rpms only. nfpm writes no .src.rpm, but the filter costs a
+          # line and an accidental source rpm is not part of the asset set.
+          rpms=()
+          for f in urnetwork-daemon[-_]*.rpm; do
+            case "$f" in *.src.rpm) continue ;; esac
+            rpms+=("$f")
+          done
+          fail=0
+          # EXACT counts, not ">= 1". This is the check that turns "one leg
+          # quietly produced nothing" into a red release instead of a release
+          # missing an architecture. n_arch comes from the run plan, so an
+          # amd64-only dispatch expects one of each and is still gated.
+          expect_count() {
+            local label="$1" got="$2" want="$3" why=""
+            # Only the per-arch families get the per-arch explanation; the SDK
+            # zip is one file for both arches and saying otherwise would send
+            # whoever reads the failure looking for the wrong thing.
+            [ "$want" = "$n_arch" ] && why=" (one per arch: $ARCHES)"
+            if [ "$got" -ne "$want" ]; then
+              echo "::error::$label: found $got, expected ${want}${why}"
+              fail=1
+            else
+              echo "ok  $label: $got"
+            fi
+          }
+          expect_count "install tarballs" "${#tarballs[@]}"  "$n_arch"
+          expect_count ".deb"             "${#debs[@]}"      "$n_arch"
+          expect_count "AppImages"        "${#appimages[@]}" "$n_arch"
+          expect_count ".zsync"           "${#zsyncs[@]}"    "$n_arch"
+          expect_count "SDK zip"          "${#sdkzips[@]}"   1
+          if [ "$REQUIRE_RPM" = "true" ]; then
+            expect_count ".rpm" "${#rpms[@]}" "$n_arch"
+          elif [ "${#rpms[@]}" -ne "$n_arch" ]; then
+            echo "::warning::${#rpms[@]} .rpm(s) for $n_arch arch(es) and UR_REQUIRE_RPM is not 'true' — publishing without the full set"
+          fi
+          # Every asset must carry THIS run's version, or a stale artifact
+          # would ride out under a fresh tag.
+          for f in "${tarballs[@]}" "${debs[@]}" "${appimages[@]}" "${zsyncs[@]}" "${sdkzips[@]}"; do
+            case "$f" in
+              *"${VERSION}"*) ;;
+              *) echo "::error::$f does not carry version ${VERSION}"; fail=1 ;;
+            esac
+          done
+          # The rpm is checked on TOKENS, not on the literal version, and the
+          # reason is rpm's rather than ours: '-' is forbidden in both Version
+          # and Release, so a version like 2026.8.20-1024590520-beta cannot
+          # appear verbatim in a legal rpm filename. make-rpm.sh splits at the
+          # first '-' and folds the tail; the date and the code survive every
+          # legal mangling, and the code is what makes an artifact unique to
+          # this run — which is the whole property this loop protects.
+          ver_date="${VERSION%%-*}"
+          ver_rest="${VERSION#*-}"
+          ver_code="${ver_rest%%-*}"
+          for f in "${rpms[@]}"; do
+            for tok in "$ver_date" "$ver_code"; do
+              case "$f" in
+                *"$tok"*) ;;
+                *) echo "::error::$f does not carry version token '$tok' from ${VERSION}"; fail=1 ;;
+              esac
+            done
+          done
+          # One AppImage per zsync, one deb per tarball: an arch that built
+          # only half its set must not reach a release.
+          [ "${#appimages[@]}" -eq "${#zsyncs[@]}" ] || { echo "::error::AppImage/zsync count mismatch"; fail=1; }
+          [ "${#tarballs[@]}" -eq "${#debs[@]}" ]    || { echo "::error::tarball/deb count mismatch"; fail=1; }
+          # And each arch must be represented in each family.
+          for arch in "${arch_arr[@]}"; do
+            for pat in "urnetwork-daemon_${VERSION}_${arch}.deb" \
+                       "urnetwork-daemon-${VERSION}-${arch}.install.tar.gz" \
+                       "URnetwork-${VERSION}-${arch}.AppImage" \
+                       "URnetwork-${VERSION}-${arch}.AppImage.zsync"; do
+              [ -s "$pat" ] || { echo "::error::missing or empty: $pat"; fail=1; }
+            done
+          done
+          ls -la
+          exit $fail
+
+      - name: Publish
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          # Re-running a run must REPLACE the tag's release, not collide with
+          # it. --cleanup-tag also drops the tag so --target below is honoured;
+          # older gh releases do not have that flag, hence the fallback.
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null \
+            || gh release delete "$tag" --yes 2>/dev/null \
+            || true
+          {
+            echo "Linux artifacts built by this fork's CI from the build repo's own pipeline"
+            echo "(\`all/build-linux.sh\` -> \`all/linux/build.sh\` -> the Ubuntu 22.04 / 24.04"
+            echo "containers). **This is not an official URnetwork release.**"
+            echo
+            echo "| asset | what it is |"
+            echo "| --- | --- |"
+            echo "| \`urnetwork-daemon-<version>-<arch>.install.tar.gz\` | the privileged service; \`tar xz && sudo urnetwork-daemon/install.sh\` |"
+            echo "| \`urnetwork-daemon_<version>_<arch>.deb\` | the same service as a native package (Debian/Ubuntu) |"
+            echo "| \`urnetwork-daemon-<version>.<rpmarch>.rpm\` | the same service as a native package (Fedora/RHEL/openSUSE) |"
+            echo "| \`URnetwork-<version>-<arch>.AppImage\` | the GUI, unprivileged |"
+            echo "| \`URnetwork-<version>-<arch>.AppImage.zsync\` | zsync control file (GitHub answers zsync's range requests with HTTP 501; the working mirror is get.ur.network) |"
+            echo "| \`URnetworkSdkLinux-<version>.zip\` | the cgo SDK shared objects + headers, both arches |"
+            echo
+            echo "The three daemon packages are the SAME payload: one \`meson install --destdir\`"
+            echo "tree, one \`assemble_daemon_root\`, one wrapper per format — they cannot ship"
+            echo "different daemons."
+            echo
+            echo "Built from:"
+            echo
+            echo "- sdk: \`${SDK_SOURCE}\`"
+            echo "- linux: \`${LINUX_SOURCE}\`"
+            echo "- build: \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`"
+            echo "- arches: \`${ARCHES}\`"
+            echo
+            echo "Daemon glibc floor 2.35 (Ubuntu 22.04) for the tarball, the .deb and the .rpm;"
+            echo "AppImage glibc floor 2.39 (Ubuntu 24.04)."
+            echo
+            echo "Unsigned, and not VirusTotal-scanned: \`all/run.sh\`'s release path does both"
+            echo "of those with credentials this CI does not have. Verify downloads against the"
+            echo "per-asset sha256 GitHub publishes in the releases JSON."
+          } > notes.md
+          # nullglob for the same reason run.sh writes *.rpm(N): without it
+          # bash hands gh an unexpanded pattern as a literal filename and the
+          # upload fails with the release ALREADY DELETED. The assert step
+          # above is what guarantees the required assets are actually here.
+          shopt -s nullglob
+          files=(
+            urnetwork-daemon-*.install.tar.gz
+            urnetwork-daemon_*.deb
+            URnetwork-*.AppImage
+            URnetwork-*.AppImage.zsync
+            URnetworkSdkLinux-*.zip
+          )
+          # Appended rather than globbed inline: make-rpm.sh may separate name
+          # from version with '-' or '_', and a .src.rpm is not part of the set.
+          for f in urnetwork-daemon[-_]*.rpm; do
+            case "$f" in *.src.rpm) continue ;; esac
+            files+=("$f")
+          done
+          printf 'uploading %s\n' "${files[@]}"
+          # --target pins the tag to the commit this run built, rather than
+          # wherever the default branch has drifted to.
+          gh release create "$tag" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes-file notes.md \
+            "${files[@]}"
+          {
+            echo "Published **$tag** with ${#files[@]} assets."
+            echo
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
