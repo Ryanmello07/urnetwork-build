@@ -129,7 +129,7 @@ else
     check "AppDir: AppRun"                    test -x "${APPDIR}/AppRun"
     check "AppDir: usr/bin/urnetwork-gui"     test -x "${APPDIR}/usr/bin/urnetwork-gui"
     check "AppDir: libURnetworkSdk.so"        test -f "${APPDIR}/usr/lib/urnetwork/libURnetworkSdk.so"
-    check "AppDir: desktop entry"             test -f "${APPDIR}/network.ur.urnetwork.desktop"
+    check "AppDir: desktop entry"             test -f "${APPDIR}/com.bringyour.network.desktop"
     check "AppDir: .DirIcon"                  test -f "${APPDIR}/.DirIcon"
     check "AppDir: compiled GSettings schemas (gschemas.compiled)" \
           test -s "${APPDIR}/usr/share/glib-2.0/schemas/gschemas.compiled"
@@ -326,11 +326,17 @@ else
   check "installed: /usr/lib/urnetwork/libURnetworkSdk.so"  test -f /usr/lib/urnetwork/libURnetworkSdk.so
   check "installed: /usr/bin/urnetwork (launcher)"          test -x /usr/bin/urnetwork
   check "installed: unit at /lib/systemd/system"            test -f /lib/systemd/system/urnetworkd.service
+  # The .desktop basename IS the app id, and the id changed to
+  # com.bringyour.network (urnetwork/linux) so Linux matches the Android and
+  # Apple clients. These three checks are the reason to assert the filename
+  # rather than just "some .desktop exists": flatpak refuses to export a file
+  # whose name is not the app id, and the icon-theme lookup, the AppStream
+  # component id and the polkit action namespace all have to agree with it.
   check "installed: desktop entry (app-id filename)" \
-        test -f /usr/share/applications/network.ur.urnetwork.desktop
+        test -f /usr/share/applications/com.bringyour.network.desktop
   check "installed: NetworkManager unmanaged marking"       test -f /etc/NetworkManager/conf.d/95-urnetwork.conf
   check "installed: udev unmanaged rule"                    test -f /etc/udev/rules.d/85-urnetwork-unmanaged.rules
-  check "installed: inert autostart template"               test -f /etc/urnetwork/autostart/network.ur.urnetwork.desktop
+  check "installed: inert autostart template"               test -f /etc/urnetwork/autostart/com.bringyour.network.desktop
   check "postinst created the 'urnetwork' system group"     getent group urnetwork
 
   # The AppImage is NEVER packaged: the launcher must fail with a hint, not a
