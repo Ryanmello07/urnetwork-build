@@ -228,6 +228,10 @@ on:
   push:
     branches:
       - linux-release-matrix
+      # The branch this workflow itself lives on in the fork. Present so the
+      # workflow can be exercised without pushing to a default branch, which
+      # is what workflow_dispatch would otherwise require.
+      - fork/release-ci
   pull_request:
     branches:
       - main
