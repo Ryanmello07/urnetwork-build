@@ -1,0 +1,8 @@
+- Regenerate the string resources from the localizations store
+- Gate the mock location COARSE grant to the fused leg only
+- Device location sync, GMS mock support, and mobile transport hardening
+- Harden Android acceptance lifecycle
+- Tablet layouts: readable column, auth form column, floating connect drawer
+- Show the referral progress bar once on the onboarding referral step
+- Blend the purple selection glow into the selected gold plan card
+- Harden Android fleet acceptance

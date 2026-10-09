@@ -24,6 +24,7 @@ roles="${ROLES:-daemon gui}"
 # Default to the arch that runs native on the Apple-Silicon host (fast). amd64
 # builds/tests under Docker's qemu emulation, so it's opt-in for the smoke test.
 ARCHES="${ARCHES:-arm64}"
+setup_arguments=("$@")
 
 usage() {
   cat <<EOF
@@ -51,6 +52,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+root="${URNETWORK_ROOT:-$(cd "$here/../../.." && pwd)}"
+network_test_gate="$root/tests/network-intensive-suite-lock.sh"
+if [ ! -x "$network_test_gate" ]; then
+  echo "Linux setup suite gate is missing or not executable: $network_test_gate" >&2
+  exit 127
+fi
+if [ "${URNETWORK_NETWORK_TEST_LOCK_HELD:-}" != 1 ]; then
+  if [ "${#setup_arguments[@]}" -eq 0 ]; then
+    exec "$network_test_gate" main-acceptance linux-setup -- "$here/setup.sh"
+  fi
+  exec "$network_test_gate" main-acceptance linux-setup -- \
+    "$here/setup.sh" "${setup_arguments[@]}"
+fi
+if ! "$network_test_gate" --verify-held main-acceptance; then
+  echo "Linux setup inherited an invalid network-intensive lock" >&2
+  exit 70
+fi
+
 # --- preflight ---------------------------------------------------------------
 echo ">>> preflight: checking docker"
 for command_name in docker timeout node go git make rsync zip zig; do
@@ -65,9 +84,10 @@ docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon not running — star
 rc=0
 for arch in ${ARCHES}; do
   for role in ${roles}; do
-    echo ">>> building the Linux ${role} builder image for ${arch} (deps baked in; layer-cached)"
+    echo ">>> building the Linux ${role} builder image for ${arch}"
     timeout --signal=TERM --kill-after=60s 3600 \
       docker build --platform "linux/${arch}" \
+      --no-cache \
       -f "${here}/Dockerfile.${role}" \
       -t "${image_base}-${role}:${arch}" "${here}"
 
@@ -84,15 +104,31 @@ for arch in ${ARCHES}; do
       rc=1
     fi
     if [ "$role" = daemon ]; then
-      echo ">>> smoke-testing the acceptance tunnel privileges for ${arch}"
+      echo ">>> smoke-testing the acceptance tunnel and cgroup-BPF privileges for ${arch}"
       if timeout --signal=TERM --kill-after=30s 120 \
            docker run --rm --platform "linux/${arch}" \
+           --privileged --cgroupns=host \
            --cap-add NET_ADMIN --device /dev/net/tun \
            "${image_base}-${role}:${arch}" \
-           bash -euc 'test -c /dev/net/tun; ip tuntap add dev uraccept0 mode tun; ip link show dev uraccept0 >/dev/null; ip link delete uraccept0'; then
-        echo ">>> ${arch}/${role}: NET_ADMIN + /dev/net/tun PASSED"
+           bash -euc '
+             test -c /dev/net/tun
+             ip tuntap add dev uraccept0 mode tun
+             ip link show dev uraccept0 >/dev/null
+             ip link delete uraccept0
+             parent_cgroup="$(sed -n "s/^0::\///p" /proc/self/cgroup)"
+             test -n "$parent_cgroup"
+             child_cgroup="/sys/fs/cgroup/$parent_cgroup/urnetwork-setup-$$"
+             mkdir "$child_cgroup"
+             trap '\''rmdir "$child_cgroup"'\'' EXIT
+             (
+               printf "%s\n" "$BASHPID" >"$child_cgroup/cgroup.procs"
+               actual="$(sed -n "s/^0::\///p" /proc/self/cgroup)"
+               test "$actual" = "${child_cgroup#/sys/fs/cgroup/}"
+             )
+           '; then
+        echo ">>> ${arch}/${role}: privileged TUN + writable host cgroup PASSED"
       else
-        echo ">>> ${arch}/${role}: NET_ADMIN + /dev/net/tun FAILED" >&2
+        echo ">>> ${arch}/${role}: privileged TUN + writable host cgroup FAILED" >&2
         rc=1
       fi
     fi

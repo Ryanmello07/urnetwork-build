@@ -1,0 +1,4 @@
+- Regenerate fresh-flow affinity strings
+
+- Expand provider memory load measurements
+- Balance provider memory and fresh-flow performance

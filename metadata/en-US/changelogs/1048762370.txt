@@ -1,0 +1,9 @@
+- Add the usdc-quote acceptance case
+- Name Solana as the network on both USDC pay surfaces
+- Notify pacing of Android network quality changes
+- Harden Android acceptance UI coordination
+- Raise the device memory target to 28 MiB and the go soft limit to 40 MiB
+- Relay platform memory trim levels to the sdk
+- Keep a failed wallet or payment row mapping out of the Go runtime
+- Announce dismiss, not cancel, on the Solana status lines
+- Drop the Solana connect states nothing renders

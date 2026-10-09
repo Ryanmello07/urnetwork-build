@@ -1,0 +1,5 @@
+- Document open throughput program work
+- PROVIDERFIXES.md: the two provider fixes, how to verify them, and the open ceiling
+- Ip: test that the upstream socket actually autotunes through the dial path
+- Ip: time the unreachable-source release with a test clock, not the wall
+- Ip: put scaledPow2WindowSize's doc comment back on scaledPow2WindowSize

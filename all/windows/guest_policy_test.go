@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package windowsbuild
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func windowsBuildRoot(t *testing.T) string {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate Windows build test")
+	}
+	return filepath.Dir(filename)
+}
+
+func readBuildFile(t *testing.T, relative string) string {
+	t.Helper()
+	filename := filepath.Join(windowsBuildRoot(t), filepath.FromSlash(relative))
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("read %s: %v", filename, err)
+	}
+	return string(data)
+}
+
+func TestReleaseBuildEnforcesGuestPolicyBeforeSourceOrBuild(t *testing.T) {
+	source := readBuildFile(t, "build.sh")
+	prepare := strings.Index(source, "win_prepare_hermetic_guest")
+	syncSource := strings.Index(source, "win_sync_source")
+	buildSDK := strings.Index(source, `win_ssh "powershell -ExecutionPolicy Bypass -File $WIN_DIR/windows/build-sdk.ps1`)
+	if prepare < 0 || syncSource < 0 || buildSDK < 0 {
+		t.Fatalf("build boundary missing: prepare=%d sync=%d sdk=%d", prepare, syncSource, buildSDK)
+	}
+	if !(prepare < syncSource && prepare < buildSDK) {
+		t.Fatalf("interruptible work can start before guest policy verification: prepare=%d sync=%d sdk=%d", prepare, syncSource, buildSDK)
+	}
+}
+
+func TestGuestPolicyStopsAndVerifiesUpdateServices(t *testing.T) {
+	source := readBuildFile(t, "disable-auto-servicing.ps1")
+	for _, required := range []string{
+		"NoAutoUpdate",
+		"NoAutoRebootWithLoggedOnUsers",
+		`@("UsoSvc", "wuauserv")`,
+		"start= disabled",
+		"WaitForStatus(",
+		"ServiceControllerStatus]::Stopped",
+		`CurrentControlSet\Services\$Name`,
+		"expected 4 (Disabled)",
+		"DoNotConnectToWindowsUpdateInternetLocations",
+		"DisableWindowsUpdateAccess",
+		"UpdateServiceUrlAlternate",
+		"UseWUServer",
+		"Start-Sleep -Seconds 2",
+		"New-NetFirewallRule",
+		`@("UsoSvc", "wuauserv", "WaaSMedicSvc")`,
+		"Get-NetFirewallServiceFilter",
+		`C:\Windows\SoftwareDistribution\Download`,
+		`Component Based Servicing\RebootPending`,
+		`WindowsUpdate\Auto Update\RebootRequired`,
+		`Stop-RequiredService "TrustedInstaller"`,
+		`Get-Process -Name "TiWorker"`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("guest policy is missing required enforcement %q", required)
+		}
+	}
+	if strings.Contains(source, "sc.exe stop   $s") {
+		t.Fatal("guest policy regressed to fire-and-forget service stops")
+	}
+	configureBoth := strings.Index(source, "foreach ($serviceName in $requiredServices) {\n    Set-RequiredServiceStartDisabled")
+	stopBoth := strings.Index(source, "foreach ($serviceName in $requiredServices) {\n    Stop-RequiredService")
+	reconfigureBoth := -1
+	if stopBoth >= 0 {
+		reconfigureRelative := strings.Index(source[stopBoth+1:], "foreach ($serviceName in $requiredServices) {\n    Set-RequiredServiceStartDisabled")
+		if reconfigureRelative >= 0 {
+			reconfigureBoth = stopBoth + 1 + reconfigureRelative
+		}
+	}
+	verifyBoth := strings.LastIndex(source, "Assert-RequiredServiceDisabledAndStopped $serviceName")
+	if configureBoth < 0 || stopBoth < 0 || reconfigureBoth < 0 || verifyBoth < 0 ||
+		configureBoth > stopBoth || stopBoth > reconfigureBoth || reconfigureBoth > verifyBoth {
+		t.Fatalf("service quiescence ordering is wrong: configure=%d stop=%d reconfigure=%d verify=%d", configureBoth, stopBoth, reconfigureBoth, verifyBoth)
+	}
+}
+
+func TestProvisioningUsesTheRuntimeGuestPolicy(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	if !strings.Contains(provision, `Join-Path $PSScriptRoot "disable-auto-servicing.ps1"`) ||
+		!strings.Contains(provision, "& $guestPolicy") {
+		t.Fatal("provisioning and runtime builds do not share one guest policy implementation")
+	}
+	setup := readBuildFile(t, "setup.sh")
+	policyCopy := strings.Index(setup, `win_scp_to "$here/disable-auto-servicing.ps1"`)
+	provisionCopy := strings.Index(setup, `win_scp_to "$here/packer/scripts/provision.ps1"`)
+	if policyCopy < 0 || provisionCopy < 0 || policyCopy > provisionCopy {
+		t.Fatalf("setup does not stage the shared policy beside provision.ps1 first: policy=%d provision=%d", policyCopy, provisionCopy)
+	}
+	packer := readBuildFile(t, "packer/windows-arm64.pkr.hcl")
+	policyUpload := strings.Index(packer, `source      = "${path.root}/../disable-auto-servicing.ps1"`)
+	powershellProvisioner := strings.Index(packer, `provisioner "powershell"`)
+	if policyUpload < 0 || powershellProvisioner < 0 || policyUpload > powershellProvisioner {
+		t.Fatalf("Packer does not upload the shared policy before provision.ps1: policy=%d provisioner=%d", policyUpload, powershellProvisioner)
+	}
+}
+
+func TestProvisioningModifiesAnExistingVisualStudioInstallation(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	for _, required := range []string{
+		`Microsoft.VisualStudio.Product.BuildTools`,
+		`-property installationPath`,
+		`$quotedVsInstallPath = '"' + $vsInstallPath + '"'`,
+		`@("modify", "--installPath", $quotedVsInstallPath) + $vsCommonArgs`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Errorf("Visual Studio reprovisioning is missing %q", required)
+		}
+	}
+	installDetection := strings.Index(provision, `-property installationPath`)
+	modifyArguments := strings.Index(provision, `@("modify", "--installPath", $quotedVsInstallPath) + $vsCommonArgs`)
+	installerStart := strings.Index(provision, `Start-Process -FilePath $vsBootstrap`)
+	if installDetection < 0 || modifyArguments < 0 || installerStart < 0 ||
+		!(installDetection < modifyArguments && modifyArguments < installerStart) {
+		t.Fatalf("existing-install selection must precede the installer: detection=%d modify=%d start=%d", installDetection, modifyArguments, installerStart)
+	}
+}
+
+func TestProvisioningInstallsAndExportsCMake(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	for _, required := range []string{
+		`"--add", "Microsoft.VisualStudio.Component.VC.CMake.Project"`,
+		`-requires Microsoft.VisualStudio.Component.VC.CMake.Project`,
+		`-find "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"`,
+		`if ([string]::IsNullOrWhiteSpace($cmakeExe) -or -not (Test-Path $cmakeExe))`,
+		`$cmakeVersion = ((& $cmakeExe --version)`,
+		`[Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')`,
+		`$env:PATH = "$cmakeBin;$env:PATH"`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Errorf("CMake provisioning is missing %q", required)
+		}
+	}
+	component := strings.Index(provision, `"--add", "Microsoft.VisualStudio.Component.VC.CMake.Project"`)
+	installer := strings.Index(provision, `Start-Process -FilePath $vsBootstrap`)
+	discovery := strings.Index(provision, `$cmakeExe = [string]`)
+	pathExport := strings.Index(provision, `$env:PATH = "$cmakeBin;$env:PATH"`)
+	if component < 0 || installer < 0 || discovery < 0 || pathExport < 0 ||
+		!(component < installer && installer < discovery && discovery < pathExport) {
+		t.Fatalf("CMake must be requested before VS runs, then verified before PATH export: component=%d installer=%d discovery=%d path=%d", component, installer, discovery, pathExport)
+	}
+
+	smoke := readBuildFile(t, "smoke-test.ps1")
+	for _, required := range []string{
+		`Get-Command cmake -ErrorAction SilentlyContinue`,
+		`& $cmake.Source --version`,
+		`Bad 'cmake' 'cmake not on PATH (zxing-cpp source build requires it)'`,
+	} {
+		if !strings.Contains(smoke, required) {
+			t.Errorf("Windows smoke test is missing CMake check %q", required)
+		}
+	}
+
+	build := readBuildFile(t, "build.sh")
+	cmakeCheck := strings.Index(build, `win_assert_guest_cmake`)
+	sourceSync := strings.Index(build, `win_sync_source "$BUILD_HOME"`)
+	if cmakeCheck < 0 || sourceSync < 0 || cmakeCheck > sourceSync {
+		t.Fatalf("standalone builds must reject missing CMake before source sync: check=%d sync=%d", cmakeCheck, sourceSync)
+	}
+}
+
+// Every provisioned cgo compiler required by the release script must be
+// executable during image smoke testing, before a release build can start.
+func TestWindowsImageSmokeCoversSdkCompilers(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	smoke := readBuildFile(t, "smoke-test.ps1")
+	buildSdk, err := os.ReadFile(filepath.Join(windowsBuildRoot(t), "..", "..", "windows", "build-sdk.ps1"))
+	if err != nil {
+		t.Fatalf("read Windows SDK build script: %v", err)
+	}
+	for _, compiler := range []string{
+		"x86_64-w64-mingw32-clang",
+		"aarch64-w64-mingw32-clang",
+	} {
+		if !strings.Contains(string(buildSdk), compiler) {
+			t.Errorf("Windows SDK build does not expose expected compiler %q", compiler)
+		}
+		if !strings.Contains(smoke, compiler) {
+			t.Errorf("Windows image smoke test does not verify required compiler %q", compiler)
+		}
+	}
+	for _, required := range []string{
+		`$llvmDir = "C:\llvm-mingw"`,
+		`Test-Path "$llvmDir\bin\clang.exe"`,
+		`$env:PATH = "$goRoot\bin;$llvmDir\bin;$env:PATH"`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Errorf("Windows provisioning is missing compiler contract %q", required)
+		}
+	}
+	for _, required := range []string{
+		`Get-Command $compiler -ErrorAction SilentlyContinue`,
+		`& $clang.Source --version`,
+		`$v -match '^clang version '`,
+		`$compiler not on PATH (cgo SDK build requires it)`,
+	} {
+		if !strings.Contains(smoke, required) {
+			t.Errorf("Windows image smoke test is missing compiler check %q", required)
+		}
+	}
+}
+
+// A reusable image is current only for the exact provisioning, guest-policy,
+// smoke-test, and SDK Go-version contract that produced its sidecar marker.
+func TestImageProvisionContractRejectsMissingAndChangedInputs(t *testing.T) {
+	root := windowsBuildRoot(t)
+	contractRoot := t.TempDir()
+	for relative, content := range map[string]string{
+		"disable-auto-servicing.ps1":   "synthetic guest policy\n",
+		"packer/scripts/provision.ps1": "synthetic provisioning\n",
+		"smoke-test.ps1":               "synthetic smoke contract\n",
+	} {
+		filename := filepath.Join(contractRoot, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	image := filepath.Join(contractRoot, "windows.qcow2")
+	if err := os.WriteFile(image, []byte("synthetic image\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+set -euo pipefail
+source "$1"
+WIN_HERE="$2"
+IMAGE="$3"
+
+fingerprint="$(win_provision_contract_fingerprint 1.26.5)"
+if win_image_provision_contract_matches "$fingerprint"; then
+  echo "missing marker was accepted" >&2
+  exit 10
+fi
+win_record_image_provision_contract "$fingerprint"
+win_image_provision_contract_matches "$fingerprint"
+
+for relative in disable-auto-servicing.ps1 packer/scripts/provision.ps1 smoke-test.ps1; do
+  fingerprint="$(win_provision_contract_fingerprint 1.26.5)"
+  win_record_image_provision_contract "$fingerprint"
+  printf 'changed\n' >>"$WIN_HERE/$relative"
+  changed_fingerprint="$(win_provision_contract_fingerprint 1.26.5)"
+  [ "$fingerprint" != "$changed_fingerprint" ]
+  if win_image_provision_contract_matches "$changed_fingerprint"; then
+    echo "changed $relative was accepted" >&2
+    exit 11
+  fi
+done
+
+fingerprint="$(win_provision_contract_fingerprint 1.26.5)"
+win_record_image_provision_contract "$fingerprint"
+changed_go_fingerprint="$(win_provision_contract_fingerprint 1.26.6)"
+[ "$fingerprint" != "$changed_go_fingerprint" ]
+if win_image_provision_contract_matches "$changed_go_fingerprint"; then
+  echo "changed SDK Go version was accepted" >&2
+  exit 12
+fi
+`
+	command := exec.Command("bash", "-c", script, "image-provision-contract-test",
+		filepath.Join(root, "lib.sh"), contractRoot, image)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("image provision contract: %v\n%s", err, output)
+	}
+}
+
+// The canonical ensure path repairs an existing image whose marker is absent
+// or stale, and publishes a replacement only after its smoke test succeeds.
+func TestEnsureReprovisionsStaleImageContract(t *testing.T) {
+	setup := readBuildFile(t, "setup.sh")
+	for _, required := range []string{
+		`provision_contract_fingerprint="$(win_provision_contract_fingerprint "$expected_go_version")"`,
+		`if [ -n "$ENSURE" ] && [ -f "$IMAGE" ] &&`,
+		`! win_image_provision_contract_matches "$provision_contract_fingerprint"; then`,
+		`REPROVISION=1`,
+		`publish_provision_contract=1`,
+	} {
+		if !strings.Contains(setup, required) {
+			t.Errorf("Windows --ensure provisioning contract is missing %q", required)
+		}
+	}
+	contractCheck := strings.Index(setup, `! win_image_provision_contract_matches "$provision_contract_fingerprint"; then`)
+	reprovisionBranch := strings.Index(setup, `if [ -n "$REPROVISION" ]; then`)
+	reuseBranch := strings.Index(setup, `elif { [ -n "$SKIP_BUILD" ] || [ -n "$ENSURE" ]; } && [ -f "$IMAGE" ]; then`)
+	smokeSection := strings.Index(setup, `# --- smoke test`)
+	if contractCheck < 0 || reprovisionBranch < 0 || reuseBranch < 0 || smokeSection < 0 ||
+		!(contractCheck < reprovisionBranch && reprovisionBranch < reuseBranch && reuseBranch < smokeSection) {
+		t.Fatalf("stale-image selection must precede the reprovision branch: check=%d branch=%d", contractCheck, reprovisionBranch)
+	}
+	if count := strings.Count(setup, `publish_provision_contract=1`); count != 2 {
+		t.Fatalf("reprovision and fresh install must each arm contract publication, found %d sites", count)
+	}
+	reprovisionArm := strings.Index(setup, `publish_provision_contract=1`)
+	freshArm := strings.LastIndex(setup, `publish_provision_contract=1`)
+	if !(reprovisionBranch < reprovisionArm && reprovisionArm < reuseBranch && reuseBranch < freshArm && freshArm < smokeSection) {
+		t.Fatalf("only repair paths may arm contract publication: reprovision=%d first=%d reuse=%d second=%d smoke=%d",
+			reprovisionBranch, reprovisionArm, reuseBranch, freshArm, smokeSection)
+	}
+	if count := strings.Count(setup, `rm -f "$image_provision_contract_path"`); count != 3 {
+		t.Fatalf("repair paths and terminal smoke failure must invalidate the old contract, found %d sites", count)
+	}
+	smokeSuccess := strings.Index(setup, `if [ "$smoke_rc" -eq 0 ]; then`)
+	recordContract := strings.Index(setup, `win_record_image_provision_contract "$provision_contract_fingerprint"`)
+	if smokeSuccess < 0 || recordContract < 0 || recordContract < smokeSuccess {
+		t.Fatalf("contract publication must follow smoke success: smoke=%d record=%d", smokeSuccess, recordContract)
+	}
+	if count := strings.Count(setup, `win_record_image_provision_contract "$provision_contract_fingerprint"`); count != 1 {
+		t.Fatalf("only terminal smoke success may record the image contract, found %d record sites", count)
+	}
+	smokeFailure := strings.Index(setup, `else
+  rm -f "$image_provision_contract_path"
+  win_die "SMOKE TEST FAILED`)
+	if smokeFailure < smokeSuccess {
+		t.Fatalf("terminal smoke failure must invalidate the image contract: success=%d failure=%d", smokeSuccess, smokeFailure)
+	}
+}
+
+func TestProvisioningRetriesTransientGoToolchainRemoval(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	for _, required := range []string{
+		`for ($removeAttempt = 1; $removeAttempt -le 30; $removeAttempt++)`,
+		`if ($removeAttempt -eq 30) { throw }`,
+		`Start-Sleep -Seconds 2`,
+		`if (Test-Path $goRoot) { throw "old Go toolchain still exists after removal retries: $goRoot" }`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Errorf("Go replacement is missing %q", required)
+		}
+	}
+	versionProbe := strings.Index(provision, `$goInstalled = (& "$goRoot\bin\go.exe" version)`)
+	removeRetry := strings.Index(provision, `for ($removeAttempt = 1; $removeAttempt -le 30; $removeAttempt++)`)
+	expandArchive := strings.Index(provision, `Expand-Archive -Path $goZip -DestinationPath "C:\" -Force`)
+	if versionProbe < 0 || removeRetry < 0 || expandArchive < 0 ||
+		!(versionProbe < removeRetry && removeRetry < expandArchive) {
+		t.Fatalf("Go replacement retry must be between version detection and extraction: version=%d retry=%d extract=%d", versionProbe, removeRetry, expandArchive)
+	}
+}
+
+func TestProvisioningUsesResumableAtomicDownloads(t *testing.T) {
+	provision := readBuildFile(t, "packer/scripts/provision.ps1")
+	for _, required := range []string{
+		`function Get-RemoteFile($Uri, $OutFile)`,
+		`$partial = "$OutFile.partial"`,
+		`"--retry", "12", "--retry-all-errors"`,
+		`"--continue-at", "-"`,
+		`Move-Item -Force $partial $OutFile`,
+		`Get-RemoteFile "https://go.dev/dl/go$goVersion.windows-arm64.zip" $goZip`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Errorf("resumable provisioning downloads are missing %q", required)
+		}
+	}
+	for _, obsolete := range []string{"Invoke-WebRequest", "DownloadString"} {
+		if strings.Contains(provision, obsolete) {
+			t.Errorf("provisioning still has a one-shot download via %s", obsolete)
+		}
+	}
+}
+
+func TestWindowsImageRejectsSdkGoVersionDrift(t *testing.T) {
+	smoke := readBuildFile(t, "smoke-test.ps1")
+	for _, required := range []string{
+		`param([Parameter(Mandatory=$true)][string]$ExpectedGoVersion)`,
+		`$expectedGo = "go version go$ExpectedGoVersion windows/arm64"`,
+		`Bad 'go' "expected '$expectedGo', got '$actualGo'"`,
+	} {
+		if !strings.Contains(smoke, required) {
+			t.Errorf("Windows smoke test is missing %q", required)
+		}
+	}
+
+	setup := readBuildFile(t, "setup.sh")
+	if !strings.Contains(setup, `expected_go_version="$(win_sdk_go_version "$root/sdk/cgo/go.mod")"`) ||
+		!strings.Contains(setup, `smoke-test.ps1 -ExpectedGoVersion $expected_go_version`) {
+		t.Error("setup does not compare the reusable image with the current SDK Go directive")
+	}
+
+	build := readBuildFile(t, "build.sh")
+	versionCheck := strings.Index(build, `win_assert_guest_go_version "$expected_go_version"`)
+	sourceSync := strings.Index(build, `win_sync_source "$BUILD_HOME"`)
+	if versionCheck < 0 || sourceSync < 0 || versionCheck > sourceSync {
+		t.Fatalf("standalone builds must reject Go drift before source sync: check=%d sync=%d", versionCheck, sourceSync)
+	}
+}
+
+func TestSdkGoVersionComesFromTheSelectedModule(t *testing.T) {
+	module := filepath.Join(t.TempDir(), "go.mod")
+	if err := os.WriteFile(module, []byte("module example.invalid/sdk\n\ngo 1.26.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "-c", `source "$1"; win_sdk_go_version "$2"`,
+		"sdk-go-version-test", filepath.Join(windowsBuildRoot(t), "lib.sh"), module)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("version read failed: %v: %s", err, output)
+	}
+	if string(output) != "1.26.5\n" {
+		t.Fatalf("version = %q, want 1.26.5", output)
+	}
+}
+
+func TestGuestGoVersionGuardRejectsDrift(t *testing.T) {
+	script := `
+source "$1"
+WIN_HERE=/synthetic/windows
+win_ssh() { printf '%s\n' "$FAKE_GUEST_GO_VERSION"; }
+win_assert_guest_go_version 1.26.5
+`
+	for _, test := range []struct {
+		version string
+		wantOK  bool
+	}{
+		{version: "go version go1.26.5 windows/arm64", wantOK: true},
+		{version: "go version go1.26.4 windows/arm64", wantOK: false},
+	} {
+		command := exec.Command("bash", "-c", script,
+			"guest-go-version-test", filepath.Join(windowsBuildRoot(t), "lib.sh"))
+		command.Env = append(os.Environ(), "FAKE_GUEST_GO_VERSION="+test.version)
+		err := command.Run()
+		if (err == nil) != test.wantOK {
+			t.Errorf("version %q: success = %t, want %t", test.version, err == nil, test.wantOK)
+		}
+	}
+}
+
+func TestGuestCMakeGuardRejectsMissingOrInvalidTool(t *testing.T) {
+	script := `
+source "$1"
+WIN_HERE=/synthetic/windows
+win_ssh() {
+  printf '%s\n' "$FAKE_GUEST_CMAKE_VERSION"
+  return "${FAKE_GUEST_CMAKE_RC:-0}"
+}
+win_assert_guest_cmake
+`
+	for _, test := range []struct {
+		name    string
+		version string
+		rc      string
+		wantOK  bool
+	}{
+		{name: "usable", version: "cmake version 4.1.1", rc: "0", wantOK: true},
+		{name: "missing", version: "", rc: "1", wantOK: false},
+		{name: "invalid output", version: "unexpected", rc: "0", wantOK: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command("bash", "-c", script,
+				"guest-cmake-test", filepath.Join(windowsBuildRoot(t), "lib.sh"))
+			command.Env = append(os.Environ(),
+				"FAKE_GUEST_CMAKE_VERSION="+test.version,
+				"FAKE_GUEST_CMAKE_RC="+test.rc)
+			err := command.Run()
+			if (err == nil) != test.wantOK {
+				t.Errorf("version %q rc %s: success = %t, want %t", test.version, test.rc, err == nil, test.wantOK)
+			}
+		})
+	}
+}
+
+func TestGuestPolicyTransportFailuresAreFatal(t *testing.T) {
+	root := windowsBuildRoot(t)
+	script := `
+set -u
+source "$1"
+WIN_HERE="$2"
+event_log="$3"
+win_scp_to() {
+  printf 'scp\n' >>"$event_log"
+  return "${FAKE_SCP_RC:-0}"
+}
+win_ssh() {
+  printf 'ssh\n' >>"$event_log"
+  return "${FAKE_SSH_RC:-0}"
+}
+win_prepare_hermetic_guest
+`
+	for _, test := range []struct {
+		name      string
+		scpRC     string
+		sshRC     string
+		wantRC    int
+		wantCalls string
+	}{
+		{name: "copy failure", scpRC: "17", sshRC: "0", wantRC: 17, wantCalls: "scp\n"},
+		{name: "policy failure", scpRC: "0", sshRC: "23", wantRC: 23, wantCalls: "scp\nssh\n"},
+		{name: "success", scpRC: "0", sshRC: "0", wantRC: 0, wantCalls: "scp\nssh\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "events")
+			command := exec.Command("bash", "-c", script, "guest-policy-test", filepath.Join(root, "lib.sh"), root, logPath)
+			command.Env = append(os.Environ(), "FAKE_SCP_RC="+test.scpRC, "FAKE_SSH_RC="+test.sshRC)
+			err := command.Run()
+			gotRC := 0
+			if err != nil {
+				var exitError *exec.ExitError
+				if !errors.As(err, &exitError) {
+					t.Fatal(err)
+				}
+				gotRC = exitError.ExitCode()
+			}
+			if gotRC != test.wantRC {
+				t.Fatalf("exit = %d, want %d", gotRC, test.wantRC)
+			}
+			calls, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(calls) != test.wantCalls {
+				t.Fatalf("calls = %q, want %q", calls, test.wantCalls)
+			}
+		})
+	}
+}

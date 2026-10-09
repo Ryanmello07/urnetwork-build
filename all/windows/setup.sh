@@ -2,7 +2,7 @@
 # One-time setup + smoke test for the local QEMU ARM Windows build environment.
 # Drives an unattended Windows install with the device layout validated
 # interactively (ramfb + usb-bot CD-ROM + NVMe disk, all inbox — no driver
-# injection), provisions the MSI toolchain (MSVC ARM64+x64, WDK, WiX, git) into
+# injection), provisions the MSI toolchain (MSVC ARM64+x64, WDK, CMake, WiX, git) into
 # the image over ssh, then smoke-tests it. The repo source is rsync'd in per build
 # (build.sh win_sync_source), not baked into the image. Run once on the
 # Apple-Silicon build host before a release.
@@ -45,8 +45,9 @@ Required (unless --skip-build reuses an existing image):
   --virtio-iso PATH    virtio-win.iso (only the NetKVM NIC driver is used)
 
 Options:
-  --ensure             reuse and smoke-test an existing image, or build it from
-                       WINDOWS_ISO and VIRTIO_ISO when it is missing
+  --ensure             reuse and smoke-test a current image; re-provision an
+                       image whose toolchain contract is missing/stale, or build
+                       it from WINDOWS_ISO and VIRTIO_ISO when it is missing
   --skip-build         reuse the existing image; only run the smoke test
   --reprovision        reuse the installed image, re-run provisioning (no OS
                        reinstall) then smoke-test — for iterating on provision.ps1
@@ -58,6 +59,7 @@ Options:
 
 One-time prep: brew install qemu
 Env overrides: IMAGE, SSH_KEY, UEFI_CODE, UEFI_VARS_TEMPLATE, CPUS, MEM, DISK_SIZE.
+CPUS must be positive and defaults to 6; GOMAXPROCS does not change guest CPUs.
 ISO gate overrides (deliberate use only): WIN_REQUIRED_BUILD / WIN_REQUIRED_EDITION
 to target a different build, or WINDOWS_ISO_SKIP_CHECK=1 to bypass the check.
 EOF
@@ -112,6 +114,7 @@ ENSURE=""
 FORCE=""
 KEEP_UP=""
 REPROVISION=""
+setup_arguments=("$@")
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -133,7 +136,32 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+root="${URNETWORK_ROOT:-$(cd "$here/../../.." && pwd)}"
+expected_go_version="$(win_sdk_go_version "$root/sdk/cgo/go.mod")" \
+  || win_die "cannot determine the SDK Go version"
+network_test_gate="$root/tests/network-intensive-suite-lock.sh"
+if [ ! -x "$network_test_gate" ]; then
+  echo "Windows setup suite gate is missing or not executable: $network_test_gate" >&2
+  exit 127
+fi
+if [ "${URNETWORK_NETWORK_TEST_LOCK_HELD:-}" != 1 ]; then
+  if [ "${#setup_arguments[@]}" -eq 0 ]; then
+    exec "$network_test_gate" main-acceptance windows-setup -- "$here/setup.sh"
+  fi
+  exec "$network_test_gate" main-acceptance windows-setup -- \
+    "$here/setup.sh" "${setup_arguments[@]}"
+fi
+if ! "$network_test_gate" --verify-held main-acceptance; then
+  echo "Windows setup inherited an invalid network-intensive lock" >&2
+  exit 70
+fi
+
 win_init
+
+stage_provision_scripts() {
+  win_scp_to "$here/disable-auto-servicing.ps1" "C:/Windows/Temp/disable-auto-servicing.ps1"
+  win_scp_to "$here/packer/scripts/provision.ps1" "C:/Windows/Temp/provision.ps1"
+}
 
 # --- preflight ---------------------------------------------------------------
 echo ">>> preflight: checking tools + firmware"
@@ -148,10 +176,23 @@ win_ensure_ssh_key
 trap win_shutdown_vm EXIT   # tear the VM down on any exit (idempotent)
 
 # --- build the image ---------------------------------------------------------
+provision_contract_fingerprint="$(win_provision_contract_fingerprint "$expected_go_version")" \
+  || win_die "cannot fingerprint the Windows image provisioning contract"
+image_provision_contract_path="$(win_image_provision_contract_path)" \
+  || win_die "cannot locate the Windows image provisioning marker"
+publish_provision_contract=""
+if [ -n "$ENSURE" ] && [ -f "$IMAGE" ] &&
+   ! win_image_provision_contract_matches "$provision_contract_fingerprint"; then
+  echo ">>> existing image has a missing or stale provisioning contract; re-provisioning it"
+  REPROVISION=1
+fi
+
 if [ -n "$REPROVISION" ]; then
   # Re-run provisioning on an already-installed image (no OS reinstall). The
   # provision script is idempotent, so this is safe to repeat while iterating.
   [ -f "$IMAGE" ] || win_die "no image to reprovision ($IMAGE) — run without --reprovision to build it first"
+  rm -f "$image_provision_contract_path"
+  publish_provision_contract=1
   echo ">>> re-provisioning the existing image in place (watch: open vnc://127.0.0.1:5901  pw 'windows')"
   win_boot_image_rw
   # 90 min: this boots the BASE image, which — unlike a hermetic post-provision
@@ -160,7 +201,7 @@ if [ -n "$REPROVISION" ]; then
   # session staged one). That boot is slow but legitimate, and timing out on it
   # hard-kills the guest mid-servicing and damages the base image.
   win_wait_ssh 1080 || win_die "VM ssh did not come up (watch on VNC 5901)"
-  win_scp_to "$here/packer/scripts/provision.ps1" "C:/Windows/Temp/provision.ps1"
+  stage_provision_scripts
   win_ssh "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/provision.ps1" \
     || win_die "provisioning failed — see output above"
   win_shutdown_vm
@@ -177,6 +218,8 @@ else
   # cost the operator the image they already had.
   check_windows_iso "$WINDOWS_ISO"
   [ -n "$FORCE" ] && rm -f "$IMAGE"
+  rm -f "$image_provision_contract_path"
+  publish_provision_contract=1
 
   # 1. unattended Windows install (leaves the VM running).
   win_install_image "$WINDOWS_ISO" "$VIRTIO_ISO" \
@@ -184,8 +227,8 @@ else
 
   # 2. provision the MSI toolchain into the image over ssh (needs the VM's network,
   #    which is up since ssh connected — NetKVM installed at first logon).
-  echo ">>> provisioning the toolchain (VS Build Tools + WDK + WiX + git + rsync; slow)"
-  win_scp_to "$here/packer/scripts/provision.ps1" "C:/Windows/Temp/provision.ps1"
+  echo ">>> provisioning the toolchain (VS Build Tools + WDK + CMake + WiX + git + rsync; slow)"
+  stage_provision_scripts
   win_ssh "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/provision.ps1" \
     || win_die "provisioning failed — see output above"
 
@@ -203,7 +246,7 @@ win_wait_ssh || win_die "VM ssh did not come up — see README.md first-run note
 echo ">>> uploading + running smoke-test.ps1"
 win_scp_to "$here/smoke-test.ps1" "C:/Windows/Temp/smoke-test.ps1"
 smoke_rc=0
-win_ssh "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/smoke-test.ps1" || smoke_rc=$?
+win_ssh "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/smoke-test.ps1 -ExpectedGoVersion $expected_go_version" || smoke_rc=$?
 
 # --keep-up: neuter the teardown trap so the VM survives for debugging.
 if [ -n "$KEEP_UP" ]; then
@@ -215,7 +258,12 @@ if [ -n "$KEEP_UP" ]; then
 fi
 
 if [ "$smoke_rc" -eq 0 ]; then
+  if [ -n "$publish_provision_contract" ]; then
+    win_record_image_provision_contract "$provision_contract_fingerprint" \
+      || win_die "could not record the smoke-verified image contract"
+  fi
   echo ">>> SMOKE TEST PASSED — the Windows build environment is ready for build.sh."
 else
+  rm -f "$image_provision_contract_path"
   win_die "SMOKE TEST FAILED (rc=$smoke_rc) — see the output above."
 fi

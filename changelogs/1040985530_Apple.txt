@@ -1,0 +1,3 @@
+- Rotate saturated provider generations
+- Retire unreliable provider sources safely
+- Bound Reliability provider retirement

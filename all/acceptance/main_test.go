@@ -3,13 +3,270 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/sdk"
 )
+
+type recordingNetworkClientRemover struct {
+	args   *sdk.RemoveNetworkClientArgs
+	byJwt  string
+	result *sdk.RemoveNetworkClientResult
+	err    error
+}
+
+// Records the SDK cleanup call without opening a network connection.
+func (self *recordingNetworkClientRemover) RemoveNetworkClientSyncWithContextAndJwt(
+	ctx context.Context,
+	args *sdk.RemoveNetworkClientArgs,
+	byJwt string,
+) (*sdk.RemoveNetworkClientResult, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("cleanup context has no deadline")
+	}
+	self.args = args
+	self.byJwt = byJwt
+	return self.result, self.err
+}
+
+type publicIpRoundTripper func(request *http.Request) (*http.Response, error)
+
+// Implements the deterministic transport seam used by public-address tests.
+func (self publicIpRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
+
+// Forces the observed Android failure: the first hostname lookup fails while
+// an independent endpoint on the same network remains healthy.
+func TestPublicIpFallsBackAfterEndpointDnsFailure(t *testing.T) {
+	urls := []string{"https://first.invalid/", "https://second.invalid/"}
+	openedUrls := []string{}
+	client := &http.Client{Transport: publicIpRoundTripper(func(request *http.Request) (*http.Response, error) {
+		openedUrls = append(openedUrls, request.URL.String())
+		if request.URL.String() == urls[0] {
+			return nil, errors.New("deterministic DNS timeout")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("203.0.113.9\n")),
+			Header:     make(http.Header),
+			Request:    request,
+		}, nil
+	})}
+
+	address, err := publicIpWithClient(context.Background(), client, urls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != "203.0.113.9" {
+		t.Fatalf("public address = %q, want 203.0.113.9", address)
+	}
+	if !reflect.DeepEqual(openedUrls, urls) {
+		t.Fatalf("opened urls = %q, want %q", openedUrls, urls)
+	}
+}
+
+// Requires every independent endpoint to fail before the probe fails.
+func TestPublicIpReportsEveryEndpointFailure(t *testing.T) {
+	urls := []string{"https://first.invalid/", "https://second.invalid/"}
+	client := &http.Client{Transport: publicIpRoundTripper(func(request *http.Request) (*http.Response, error) {
+		return nil, errors.New("deterministic DNS timeout")
+	})}
+
+	_, err := publicIpWithClient(context.Background(), client, urls)
+	if err == nil {
+		t.Fatal("all-endpoint DNS failure was accepted")
+	}
+	for _, url := range urls {
+		if !strings.Contains(err.Error(), url) {
+			t.Fatalf("failure omitted %q: %v", url, err)
+		}
+	}
+}
+
+// Prevents an HTTP success page from being mistaken for an address.
+func TestPublicIpRejectsInvalidEndpointBodies(t *testing.T) {
+	client := &http.Client{Transport: publicIpRoundTripper(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("not an address\n")),
+			Header:     make(http.Header),
+			Request:    request,
+		}, nil
+	})}
+
+	if _, err := publicIpWithClient(context.Background(), client, []string{"https://invalid.test/"}); err == nil {
+		t.Fatal("invalid public IP response was accepted")
+	}
+}
+
+// Reproduces the Linux teardown failure at its ownership boundary: cleanup
+// must use the still-live SDK API instead of raw net/http, whose resolver can
+// retain the tunnel-only DNS server after /etc/resolv.conf is restored.
+func TestRemoveClientUsesSdkNetworkTransport(t *testing.T) {
+	clientId := "00000000-0000-0000-0000-000000000123"
+	remover := &recordingNetworkClientRemover{result: &sdk.RemoveNetworkClientResult{}}
+	const networkJwt = "network-owner-jwt"
+	if err := removeClient(remover, networkJwt, clientId); err != nil {
+		t.Fatal(err)
+	}
+	if remover.args == nil || remover.args.ClientId == nil || remover.args.ClientId.String() != clientId {
+		t.Fatalf("remove args = %+v, want client %s", remover.args, clientId)
+	}
+	if remover.byJwt != networkJwt {
+		t.Fatalf("cleanup jwt = %q, want explicit network-owner jwt", remover.byJwt)
+	}
+}
+
+// Keeps already-removed cleanup idempotent while changing the transport.
+func TestRemoveClientAcceptsAnAlreadyRemovedClient(t *testing.T) {
+	remover := &recordingNetworkClientRemover{result: &sdk.RemoveNetworkClientResult{
+		Error: &sdk.ApiError{Message: "Client does not exist."},
+	}}
+	if err := removeClient(remover, "network-owner-jwt", "00000000-0000-0000-0000-000000000123"); err != nil {
+		t.Fatalf("already removed client = %v", err)
+	}
+}
+
+// Keeps the acceptance runner aligned with the two independent desktop
+// service protocols. Windows is intentionally newer than Linux; treating the
+// Linux version as a universal constant rejects a correctly packaged MSI.
+func TestValidateControlProtocolUsesPlatformContract(t *testing.T) {
+	for _, test := range []struct {
+		platform string
+		version  int
+	}{
+		{platform: "linux", version: 1},
+		{platform: "windows", version: 4},
+	} {
+		if err := validateControlProtocol(test.platform, test.version); err != nil {
+			t.Fatalf("valid %s protocol rejected: %v", test.platform, err)
+		}
+	}
+
+	for _, version := range []int{0, 1, 3, 5} {
+		if err := validateControlProtocol("windows", version); err == nil {
+			t.Fatalf("Windows accepted incompatible control protocol %d", version)
+		}
+	}
+	if err := validateControlProtocol("linux", 4); err == nil {
+		t.Fatal("Linux accepted the Windows control protocol")
+	}
+	if err := validateControlProtocol("darwin", 1); err == nil {
+		t.Fatal("unsupported platform accepted a control protocol")
+	}
+}
+
+// Requires every service start to carry one complete, named mTLS generation.
+func TestPinnedStartTunnelPayloadCarriesCompleteDeviceRpcGeneration(t *testing.T) {
+	config := tunnelConfig{
+		ByJwt:             "client-jwt",
+		NetworkSpaceJson:  "space-json",
+		InstanceId:        "instance-id",
+		AppVersion:        "app-version",
+		RpcServerPem:      "server-pem",
+		RpcClientCertPem:  "client-cert-pem",
+		RpcListenHostPort: "127.0.0.1:12042",
+		RpcSessionId:      "rpc-session-id",
+	}
+	want := map[string]any{
+		"by_jwt":              config.ByJwt,
+		"network_space_json":  config.NetworkSpaceJson,
+		"instance_id":         config.InstanceId,
+		"app_version":         config.AppVersion,
+		"rpc_server_pem":      config.RpcServerPem,
+		"rpc_client_cert_pem": config.RpcClientCertPem,
+		"rpc_listen_hostport": config.RpcListenHostPort,
+		"rpc_session_id":      config.RpcSessionId,
+	}
+	if got := pinnedStartTunnelPayload(config); !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinned start payload = %#v, want %#v", got, want)
+	}
+}
+
+// Prevents the Docker acceptance agent from inheriting the daemon's cgroup-BPF
+// socket mark and bypassing the tunnel it is supposed to measure.
+func TestLinuxRunnerIsolatesDaemonCgroupBeforeExec(t *testing.T) {
+	scriptBytes, err := os.ReadFile("run-linux.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(scriptBytes)
+	move := strings.Index(script, `printf '%s\n' "$BASHPID" >"$daemon_cgroup/cgroup.procs"`)
+	exec := strings.Index(script, `exec "$daemon" --foreground`)
+	agent := strings.Index(script, `URNETWORK_CONTROL_SOCKET="$socket" "$agent"`)
+	if move < 0 || exec < 0 || agent < 0 {
+		t.Fatalf("Linux runner is missing the daemon cgroup move, exec, or agent boundary")
+	}
+	if !(move < exec && exec < agent) {
+		t.Fatalf("Linux runner ordering is move=%d exec=%d agent=%d, want move < exec < agent", move, exec, agent)
+	}
+	if !strings.Contains(script, `daemon_cgroup_path="$(sed -n 's/^0::\///p' "/proc/$daemon_pid/cgroup")"`) {
+		t.Fatal("Linux runner does not verify the daemon's live cgroup after launch")
+	}
+}
+
+// A functional result cannot overrule evidence that the installed daemon left
+// a Pion ICE worker behind. The first main run remained silent for 18 minutes
+// after its assertions and was still recorded as PASS; keep the live detector,
+// stack capture, and terminal gate together and ordered around the agent.
+func TestLinuxRunnerFailsOnWebRtcTeardownStall(t *testing.T) {
+	scriptBytes, err := os.ReadFile("run-linux.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(scriptBytes)
+	agentStart := strings.Index(script, `agent_pid=$!`)
+	watchdogStart := strings.Index(script, "watch_teardown_stall &")
+	agentWait := strings.Index(script, `wait "$agent_pid"`)
+	terminalGate := strings.LastIndex(script, `teardown-stall.detected`)
+	if agentStart < 0 || watchdogStart < 0 || agentWait < 0 || terminalGate < 0 {
+		t.Fatal("Linux runner is missing the agent owner, teardown watcher, wait, or terminal gate")
+	}
+	if !(agentStart < watchdogStart && watchdogStart < agentWait && agentWait < terminalGate) {
+		t.Fatalf(
+			"Linux teardown gate ordering is agent=%d watcher=%d wait=%d gate=%d",
+			agentStart,
+			watchdogStart,
+			agentWait,
+			terminalGate,
+		)
+	}
+	for _, required := range []string{
+		`\[peerconn\]teardown stalled`,
+		`kill -QUIT "$stalled_pid"`,
+		`"$UR_ACCEPT_ARTIFACTS/teardown-stall.detected"`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("Linux teardown gate is missing %q", required)
+		}
+	}
+}
+
+// Uses fixed entropy to prove the session name is opaque and deterministic at
+// the boundary, while production supplies crypto/rand.Reader.
+func TestMintRpcSessionId(t *testing.T) {
+	got, err := mintRpcSessionId(bytes.NewReader(bytes.Repeat([]byte{0xff}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != strings.Repeat("ff", 16) {
+		t.Fatalf("RPC session ID = %q, want 128 bits of hexadecimal entropy", got)
+	}
+	if _, err := mintRpcSessionId(bytes.NewReader(nil)); err == nil {
+		t.Fatal("RPC session ID accepted insufficient entropy")
+	}
+}
 
 // Records every SDK session transition made by the guest lifecycle verifier.
 type recordingGuestSession struct {

@@ -1,6 +1,6 @@
 # Windows build environment — options & decision
 
-The Windows MSI must be built on Windows (msbuild + WDK + WiX). The build host is
+The Windows MSI must be built on Windows (MSBuild + WDK + CMake + WiX). The build host is
 an **Apple-Silicon Mac**. This doc records what does and doesn't work for running
 that Windows build environment from the Mac, and how it wires into `../run.sh`.
 
@@ -33,7 +33,7 @@ does headless, `Autounattend.xml`-driven Windows installs and runs on Apple
 Silicon.
 
 - **Provision once (Packer):** boot the Win11 ARM64 ISO with an autounattend that
-  installs VS Build Tools + WDK + WiX + OpenSSH Server, then export a `qcow2`.
+  installs VS Build Tools + WDK + CMake + WiX + OpenSSH Server, then export a `qcow2`.
 - **Each release (`build.sh`):** boot that image headless with QEMU (HVF), wait
   for ssh, hand off to the *existing* `windows/app/build.ps1` over ssh, copy the
   MSIs back, shut the VM down.
@@ -90,10 +90,11 @@ explicitly, so they're unaffected.
 |---|---|
 | `setup.sh` | **one-time setup + smoke test** — verifies the ISO is 24H2/Pro (see "Windows ISO"), installs Windows unattended, provisions the toolchain, verifies it. Run this first. |
 | `lib.sh` | shared VM lifecycle (install, boot CoW overlay, boot-in-place, **rsync source in**, ssh/scp, teardown) — sourced by `setup.sh` + `build.sh` |
-| `build.sh` | per-release: boot a CoW overlay (VNC 5901 + monitor for diagnosis), **rsync `BUILD_HOME` in**, deliver the SDK zip, run `build.ps1`, retrieve MSIs, shut down; screendumps to `output/build-fail.ppm` if ssh never comes up |
-| `smoke-test.ps1` | run in the VM by `setup.sh`: checks MSVC (ARM64+x64), Windows SDK, WDK, WiX, git, **rsync + the `cmd` ssh shell** |
+| `build.sh` | per-release: boot a CoW overlay (VNC 5901 + monitor for diagnosis), enforce the hermetic guest policy, **rsync `BUILD_HOME` in**, deliver the SDK zip, run `build.ps1`, retrieve MSIs, shut down; screendumps to `output/build-fail.ppm` if ssh never comes up |
+| `disable-auto-servicing.ps1` | shared provisioning/runtime guard: blocks Windows Update sources and verifies `UsoSvc` + `wuauserv` are disabled and stopped before a build starts |
+| `smoke-test.ps1` | run in the VM by `setup.sh`: checks MSVC (ARM64+x64), Windows SDK, WDK, CMake, Go, llvm-mingw (amd64+arm64), WiX, git, **rsync + the `cmd` ssh shell** |
 | `packer/http/Autounattend.pkrtpl.xml` | unattended install; bakes the stable ssh key, sets locale, enables OpenSSH, installs NetKVM at first logon |
-| `packer/scripts/provision.ps1` | installs VS Build Tools (ARM64+x64) + WDK + WiX + git + a pinned cwRsync; sets the `cmd` ssh shell |
+| `packer/scripts/provision.ps1` | installs VS Build Tools (ARM64+x64, including CMake) + WDK + WiX + git + a pinned cwRsync; sets the `cmd` ssh shell |
 
 The `packer/` directory name is vestigial — only the autounattend template and
 `provision.ps1` are used; there is no Packer build.
@@ -110,6 +111,7 @@ brew install qemu
   --windows-iso ~/isos/Win11_24H2_English_Arm64.iso \
   --virtio-iso  ~/isos/virtio-win.iso
 # re-run just the smoke test on an existing image:   ./setup.sh --skip-build
+# reuse a current image or repair a stale one:       ./setup.sh --ensure
 # re-provision without reinstalling Windows:         ./setup.sh --reprovision
 # leave the VM up to debug over ssh:                 ./setup.sh --skip-build --keep-up
 ```
@@ -117,12 +119,30 @@ brew install qemu
 `setup.sh` and `build.sh` share `lib.sh`, so a green smoke test means `build.sh`
 boots the same working VM.
 
+`--ensure` pairs the reusable image with a private provisioning fingerprint of
+the guest policy, provisioning script, smoke contract, and SDK Go version. It
+reuses a matching image, but automatically re-provisions an existing image
+whose marker is missing or stale. `--skip-build` deliberately performs only the
+smoke test; use it when repair is not intended.
+
+Every active QEMU path uses the CPU count resolved by `win_init`. `CPUS`
+controls the Windows guest topology and defaults to six; a malformed explicit
+value is rejected before QEMU starts. It is deliberately independent of
+inherited `GOMAXPROCS`, which budgets host-side Go work. Coupling the two can
+silently produce a one-vCPU guest and make the ARM64 link exceed its watchdog.
+
 ### Per release (automatic)
 
 `build/all/build-windows.sh` (run.sh's windows build part, which also runs
 standalone on the local branches as-is) calls `build.sh` with
 `OUT_DIR`/`VERSION`/`SDK_VERSION` (and the exported `BUILD_HOME`). The cgo SDK
 builds in the VM (`windows/build-sdk.ps1`), then the MSIs.
+Release builds retain the default `amd64,arm64` plan. A focused caller may set
+`WINDOWS_BUILD_ARCHITECTURES=amd64` or `arm64`; the selector limits the SDK,
+dependency preparation, solution restore/build, and resulting MSI rather than
+discarding an unused artifact after a dual build. Only a caller whose separate
+unit harness already ran the build contracts may also set
+`WINDOWS_BUILD_SKIP_CONTRACT_TESTS=1`.
 It boots a copy-on-write overlay of the image (base stays pristine) and rsyncs
 the build home in, so releases build the exact local state. MSIs are uploaded
 to the GitHub release; **Store submission is manual.**

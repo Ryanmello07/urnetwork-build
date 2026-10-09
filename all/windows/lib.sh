@@ -11,14 +11,30 @@
 # Not executable on its own. Callers set `set -euo pipefail`, then win_init.
 # SPDX-License-Identifier: MPL-2.0
 
+# Accept only positive decimal values that Bash can compare safely. CPUS is the
+# Windows guest topology and is deliberately independent of GOMAXPROCS, which
+# budgets host-side Go work. An explicit invalid CPUS is fatal.
+win_is_positive_integer() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 0 ] 2>/dev/null
+}
+
 win_init() {
+  local requested_cpus="${CPUS:-}"
+
+  if [ -n "$requested_cpus" ] && ! win_is_positive_integer "$requested_cpus"; then
+    win_die "CPUS must be a positive integer (got '$requested_cpus')"
+  fi
+  CPUS="${requested_cpus:-6}"
+
   WIN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   IMAGE="${IMAGE:-$WIN_HERE/output/windows-arm64.qcow2}"
   SSH_KEY="${SSH_KEY:-$WIN_HERE/.ssh/id_ed25519}"
   SSH_PORT="${SSH_PORT:-2222}"
   UEFI_CODE="${UEFI_CODE:-/opt/homebrew/share/qemu/edk2-aarch64-code.fd}"
   UEFI_VARS_TEMPLATE="${UEFI_VARS_TEMPLATE:-/opt/homebrew/share/qemu/edk2-arm-vars.fd}"
-  CPUS="${CPUS:-6}"
   MEM="${MEM:-8192}"
   DISK_SIZE="${DISK_SIZE:-90G}"
   # The Windows ISO this VM stack REQUIRES: 11 24H2 == build 26100, Pro edition.
@@ -52,6 +68,19 @@ win_init() {
   WIN_MON_SOCK=""
 }
 
+# Keep ignored/private acceptance artifacts outside the Windows VM build root.
+# Callers use --delete-excluded as well, so an artifact copied by an older
+# filter cannot survive forever and later be mistaken for source or compiled.
+win_source_rsync_excludes() {
+  WIN_SOURCE_RSYNC_EXCLUDES=(
+    --exclude=.git/
+    --exclude=node_modules/
+    --exclude=tests/__acceptance__/
+    --exclude='*.test'
+    --exclude=.DS_Store
+  )
+}
+
 # Mirror the build server's whole build home into the VM verbatim — the VM builds
 # the exact local state run.sh set up (all repos, on their correct branches),
 # exactly like the Linux container's bind mount. A pinned cwRsync + a cmd ssh shell
@@ -59,22 +88,22 @@ win_init() {
 win_sync_source() {
   local src="$1"
   [ -d "$src" ] || win_die "build dir not found: $src"
-  # Allowlist: the VM build needs only five repos — the app (windows/) and the
-  # cgo SDK with its local module deps (sdk/ + connect/ + glog/ + goidenticons/,
+  win_source_rsync_excludes
+  # Allowlist: the VM build needs the app (windows/) and the cgo SDK with its
+  # local module deps (sdk/ + connect/ + gvisor/ + glog/ + goidenticons/,
   # wired by sdk/cgo's replace directives; goidenticons backs the SDK's
   # post-quantum device identity). Sync just those, not the whole build home:
   # BUILD_HOME also holds the VM's OWN ~24GB disk image (all/windows/output/
   # *.qcow2 — copying the VM into itself), ~4GB of .git, node_modules, and every
   # other platform's repo, which made openrsync-over-cwRsync crawl (the "stuck at
-  # syncing the build home" hang). Within the five, drop the usual .git
+  # syncing the build home" hang). Within this allowlist, drop the usual .git
   # (build-sdk.ps1 passes -buildvcs=false, so Go doesn't need it) + node_modules.
   # --delete only ever touches the VM, never $src; --progress shows per-file
   # activity so the sync isn't a silent wait. To add a repo, list it here.
-  rsync -a --delete --progress \
-    --exclude=.git \
-    --exclude=node_modules \
+  rsync -a --delete --delete-excluded --progress \
+    "${WIN_SOURCE_RSYNC_EXCLUDES[@]}" \
     -e "ssh -i $SSH_KEY -p $SSH_PORT ${WIN_SSH_OPTS[*]}" \
-    "$src/windows" "$src/sdk" "$src/connect" "$src/glog" "$src/goidenticons" \
+    "$src/windows" "$src/sdk" "$src/connect" "$src/gvisor" "$src/glog" "$src/goidenticons" \
     "builder@127.0.0.1:$WIN_DIR_UNIX/"
 }
 
@@ -86,6 +115,113 @@ win_require_tools() {
     command -v "$t" >/dev/null 2>&1 || { echo "  missing: $t" >&2; missing=1; }
   done
   return $missing
+}
+
+# Read the exact toolchain version required by the SDK that this build will
+# sync. Reject an absent or malformed directive instead of letting Go's
+# automatic toolchain download hide a stale reusable image.
+win_sdk_go_version() {
+  local module="$1" version
+  [ -f "$module" ] || { echo "SDK Go module is missing: $module" >&2; return 1; }
+  version="$(awk '$1 == "go" { print $2; exit }' "$module")"
+  printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || {
+    echo "SDK Go module has no valid go directive: $module" >&2
+    return 1
+  }
+  printf '%s\n' "$version"
+}
+
+# Fingerprint every source-controlled input that defines whether a reusable
+# image has the complete toolchain expected by setup's smoke test.
+win_provision_contract_fingerprint() {
+  local expected_go_version="$1" relative filename source_digest manifest=""
+  for relative in \
+    disable-auto-servicing.ps1 \
+    packer/scripts/provision.ps1 \
+    smoke-test.ps1; do
+    filename="$WIN_HERE/$relative"
+    [ -f "$filename" ] || {
+      echo "Windows provisioning contract input is missing: $filename" >&2
+      return 1
+    }
+    source_digest="$(shasum -a 256 "$filename" | awk '{print $1}')" || return
+    manifest="${manifest}${relative}=${source_digest}"$'\n'
+  done
+  manifest="${manifest}sdk-go=${expected_go_version}"$'\n'
+  printf '%s' "$manifest" | shasum -a 256 | awk '{print $1}'
+}
+
+# Locate the private sidecar paired with the reusable base image.
+win_image_provision_contract_path() {
+  [ -n "${IMAGE:-}" ] || {
+    echo "Windows image path is unset" >&2
+    return 1
+  }
+  printf '%s.provision.sha256\n' "$IMAGE"
+}
+
+# Accept a reusable image only when its last successful provisioning used the
+# exact current contract fingerprint.
+win_image_provision_contract_matches() {
+  local expected_fingerprint="$1" marker actual_fingerprint
+  marker="$(win_image_provision_contract_path)" || return
+  [ -f "$IMAGE" ] && [ -f "$marker" ] || return 1
+  actual_fingerprint="$(cat "$marker")" || return
+  [ "$actual_fingerprint" = "$expected_fingerprint" ]
+}
+
+# Publish the contract only after provisioning, durable base-image shutdown,
+# and the subsequent smoke test all succeed; an interrupted update stays stale.
+win_record_image_provision_contract() {
+  local fingerprint="$1" marker temporary_marker
+  [ -f "$IMAGE" ] || {
+    echo "cannot record provisioning contract for missing image: $IMAGE" >&2
+    return 1
+  }
+  marker="$(win_image_provision_contract_path)" || return
+  temporary_marker="${marker}.tmp.$$"
+  if ! (umask 077 && printf '%s\n' "$fingerprint" >"$temporary_marker"); then
+    return 1
+  fi
+  if ! mv -f "$temporary_marker" "$marker"; then
+    rm -f "$temporary_marker"
+    return 1
+  fi
+}
+
+# Validate a running guest before the expensive source sync/build. A mismatch
+# is a provisioning error, not permission to fetch a second toolchain through
+# the guest's comparatively fragile QEMU network path.
+win_assert_guest_go_version() {
+  local expected="$1" actual expected_line
+  actual="$(win_ssh 'C:\go\bin\go.exe version' | tr -d '\r')" || return
+  expected_line="go version go${expected} windows/arm64"
+  if [ "$actual" != "$expected_line" ]; then
+    echo "Windows base image Go mismatch: expected '$expected_line', got '$actual'." >&2
+    echo "Run $WIN_HERE/setup.sh --reprovision before building." >&2
+    return 1
+  fi
+}
+
+# CMake is an image dependency, not a release dependency: fetch-deps.ps1 builds
+# pinned zxing-cpp source for each requested architecture before MSBuild begins.
+# Fail before the expensive source sync when an older reusable image predates
+# that tool, and point the operator at the only durable repair.
+win_assert_guest_cmake() {
+  local version
+  version="$(win_ssh 'powershell -NoProfile -NonInteractive -Command "$cmake = Get-Command cmake -ErrorAction SilentlyContinue; if (-not $cmake) { exit 1 }; $version = (& $cmake.Source --version 2>&1 | Select-Object -First 1); if ($LASTEXITCODE -ne 0) { Write-Error $version; exit 1 }; Write-Output $version"' | tr -d '\r')" || {
+    echo "Windows base image CMake is missing or unusable." >&2
+    echo "Run $WIN_HERE/setup.sh --reprovision before building." >&2
+    return 1
+  }
+  case "$version" in
+    "cmake version "*) echo "Windows base image CMake: $version" ;;
+    *)
+      echo "Windows base image returned an invalid CMake version: '$version'." >&2
+      echo "Run $WIN_HERE/setup.sh --reprovision before building." >&2
+      return 1
+      ;;
+  esac
 }
 
 win_ensure_ssh_key() {
@@ -103,6 +239,21 @@ win_ssh() {
 }
 win_scp_to()   { scp -i "$SSH_KEY" -P "$SSH_PORT" "${WIN_SSH_OPTS[@]}" "$1" "builder@127.0.0.1:$2"; }
 win_scp_from() { scp -i "$SSH_KEY" -P "$SSH_PORT" "${WIN_SSH_OPTS[@]}" "builder@127.0.0.1:$1" "$2"; }
+
+# Enforce the hermetic-guest policy on EVERY throwaway overlay, not only when
+# its base image happened to be provisioned. The production build host exposed
+# an older-but-otherwise-valid image whose wuauserv/UsoSvc policy was absent;
+# TrustedInstaller rebooted that guest in the middle of whole-program linking.
+# Copy the current script before source sync so stale images cannot carry a
+# stale policy implementation either. Any copy, policy, stop, or verification
+# failure is fatal to the caller.
+win_prepare_hermetic_guest() {
+  local source="$WIN_HERE/disable-auto-servicing.ps1"
+  local remote="C:/Windows/Temp/urnetwork-disable-auto-servicing.ps1"
+  [ -f "$source" ] || { echo "missing hermetic guest policy: $source" >&2; return 1; }
+  win_scp_to "$source" "$remote" || return
+  win_ssh "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $remote"
+}
 
 # Build a small CD image carrying autounattend.xml (rendered with the ssh key).
 # Windows scans removable media for autounattend.xml at the root.

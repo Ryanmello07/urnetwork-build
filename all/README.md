@@ -5,6 +5,49 @@ checked by the script at startup; the two below are host setup it can't do for
 you. See `build/DESKTOP_BUILD.md` for architecture and `windows/README.md` +
 `linux/README.md` for the desktop builds.
 
+## Required release components
+
+Every enabled component and attempted release-input generator in `run.sh` is a
+release gate. iOS/macOS build, signing/export, validation, store upload, and GitHub
+upload failures stop the release; missing, empty, or stale Apple exports cannot
+stand in for a new build. Windows/Linux must produce all outputs for their existing
+selected architecture/role plans, including RPM, Arch packages, and the existing
+single-architecture Flatpak. Every GitHub artifact must be a nonempty regular file.
+
+Notifications and best-effort VirusTotal observations are not build components.
+`BUILD_TEST`, `CONNECT_IP_UPDATE`, and `WARP_SKIP_DEPLOY` keep their explicit
+opt-in/skip behavior; commented-out build targets remain disabled.
+
+The GitBook `docs` repository is retired and is no longer a release submodule.
+The current documentation and legal sources live in `$WARP_HOME/mmm/ur.io/docs`.
+The web build reads that corpus for ur.io and for the legacy plain-text legal
+documents; documentation generation and web checks remain required. Historical
+release tags retain their original `docs` submodule pins.
+
+The extension consumes the exact localizations version published by the same
+release. It has no npm SDK dependency: it builds against this run's `sdk/js`
+checkout. Before editing its lockfile, `run.sh` uses a new empty npm cache on
+every readiness attempt to fetch and inspect the exact package tarball. This
+prevents an early cached ETARGET/E404 response from hiding a version after it
+reaches the registry. Expected ETARGET/exact-tarball
+E404 propagation misses retry for at most 60 attempts at 10-second intervals;
+authentication, transport, and other registry failures remain immediately
+fatal. The bounds can be changed for controlled testing via
+`NPM_PACKAGE_READY_MAX_ATTEMPTS` and
+`NPM_PACKAGE_READY_RETRY_DELAY_SECONDS`. The subsequent dependency install also
+uses a new empty cache on every attempt, because npm's normal cache or another
+registry edge can still replay an earlier ETARGET after the independent
+readiness probe succeeds. Only an ETARGET naming that exact release dependency
+is retried, for at most 6 attempts at 10-second intervals; all other install
+failures are immediately fatal. Its controlled-test bounds are
+`NPM_INSTALL_READY_MAX_ATTEMPTS` and
+`NPM_INSTALL_READY_RETRY_DELAY_SECONDS`. npm acknowledges a publish with HTTP
+202 before asynchronous processing finishes, so the localizations publisher
+also owns this readiness proof. If an accepted job is still absent after the
+full window, it resubmits the same immutable version once and proves readiness
+again. Hard failures are not resubmitted; `NPM_PUBLISH_READY_MAX_ATTEMPTS`
+changes the accepted-publication bound only for controlled testing.
+
 ## Passwordless sudo (required when tests are enabled)
 
 When `BUILD_TEST` is set, `run.sh` brings up a local test environment
@@ -43,7 +86,7 @@ brew install gnu-sed         # run.sh uses BUILD_SED=gsed (GNU sed)
   Usually already installed; otherwise `brew install --cask docker`. Run
   `linux/setup.sh` once to build + smoke-test the Linux builder container.
 
-The language toolchains (`go 1.26.4`, `java 21`, `node`/`npm`, the Android SDK,
+The language toolchains (`go 1.27.2`, `java 21`, `node`/`npm`, the Android SDK,
 `warpctl`) are validated by `run.sh` at startup — install those per the main build
 docs.
 
@@ -73,3 +116,7 @@ flaked. Uploading to the GitHub release stays in `run.sh`.
   The script is both the host launcher and the container entrypoint (its
   `container-build` phase), and the fdroiddata recipe seds the pinned go
   version out of it — keep the recipe's prebuild path in sync if it moves.
+  run.sh pushes `v<version>-fdroid` (on the `v<version>-ungoogle` commit) only
+  after the github APKs in the `v<version>`, `+2` and `+3` releases are
+  published. F-Droid should track `UpdateCheckMode: Tags .+-fdroid$`; the plain
+  and `-ungoogle` tags are pushed before the builds and can lack APKs.

@@ -20,22 +20,32 @@
 #   OUT_DIR                where the .msi files land; existing .msi files in it
 #                          are removed so the caller never picks up stale ones
 #                          (default: ${BUILD_OUT:-$BUILD_HOME/out}/desktop/windows)
+#   WINDOWS_BUILD_ARCHITECTURES
+#                          amd64, arm64, or amd64,arm64 (default). Acceptance may
+#                          select arm64 without changing the release default.
+#   WINDOWS_BUILD_SKIP_CONTRACT_TESTS
+#                          1 skips build-boundary unit tests for a caller whose
+#                          separate unit harness already owns them (default 0).
 #
 # SPDX-License-Identifier: MPL-2.0
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export BUILD_HOME="${BUILD_HOME:-$(dirname "$here")}"
+BUILD_HOME="${BUILD_HOME:-$(dirname "$here")}"
+export BUILD_HOME
+
+# shellcheck source=windows/build-plan.sh
+source "$here/windows/build-plan.sh"
+win_windows_build_plan
 
 # Optionally stage local working-tree repos over the build root so this builds
 # LOCAL (possibly uncommitted) changes. No-op unless SRC_HOME / SRC_<REPO> is set
 # (release builds via run.sh stage BUILD_HOME themselves and pass no SRC_*).
 # shellcheck source=stage-local-repos.sh
-# sdk/cgo/go.mod replaces sdk, connect, AND glog with local paths, so all three
-# must be staged together or the module graph mismatches (a stale glog vs the
-# staged sdk breaks resolution).
+# sdk/cgo/go.mod replaces sdk, connect, gvisor, glog and goidenticons with
+# local paths. Stage the complete dependency closure together.
 source "$here/stage-local-repos.sh"
-stage_local_repos sdk connect glog goidenticons windows
+stage_local_repos sdk connect gvisor glog goidenticons windows
 
 # Say plainly WHICH tree is about to be built. This script builds
 # $BUILD_HOME/windows — a release-staged checkout — and stage_local_repos is a
@@ -111,3 +121,5 @@ OUT_DIR="$OUT_DIR" \
 VERSION="$EXTERNAL_WARP_VERSION" \
 SDK_VERSION="$WARP_VERSION" \
     "$here/windows/build.sh"
+
+win_windows_verify_msi_outputs "$OUT_DIR" "$EXTERNAL_WARP_VERSION"

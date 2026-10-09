@@ -898,7 +898,9 @@ jobs:
             required=("urnetwork-daemon_${V}_${ARCH}.deb" "urnetwork-daemon-${V}-${ARCH}.install.tar.gz")
             forbidden=(URnetwork-*.AppImage URnetwork-*.AppImage.zsync)
           else
-            required=("URnetwork-${V}-${ARCH}.AppImage" "URnetwork-${V}-${ARCH}.AppImage.zsync")
+            # No .AppImage.zsync: upstream stopped building one (0d9b0b7), and
+            # build-arch.sh now fails the leg if one appears.
+            required=("URnetwork-${V}-${ARCH}.AppImage")
             forbidden=(urnetwork-daemon_*.deb urnetwork-daemon-*.install.tar.gz urnetwork-daemon*.rpm)
           fi
           for f in "${required[@]}"; do
@@ -944,7 +946,6 @@ jobs:
             out/desktop/linux/*.install.tar.gz
             out/desktop/linux/*.rpm
             out/desktop/linux/*.AppImage
-            out/desktop/linux/*.AppImage.zsync
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------

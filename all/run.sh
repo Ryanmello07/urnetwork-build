@@ -4,17 +4,50 @@
 # WARP_HOME
 # APPLE_API_KEY
 # APPLE_API_ISSUER
-# GITHUB_API_KEY
+# GITHUB_API_KEY (release creation, artifact uploads and finalization)
 # (optional) BUILD_OUT
+# The all-release IP refresh requires geoipupdate and these readable inputs:
+# GEOIP_CONF_FILE defaults to $WARP_HOME/vault/mm-geoip.yml (MaxMind YAML)
+# ARIN_CREDENTIALS_FILE defaults to $WARP_HOME/vault/arin.yml (replacement key)
+# ARIN_RULES_FILE defaults to $WARP_HOME/config/$BUILD_ENV/arindb.yml (reviewed rules)
+# ARIN_SUBSCRIBER_CATALOG_FILE defaults to
+#            $WARP_HOME/config/$BUILD_ENV/arindb-subscribers/catalog.yml (reviewed
+#            subscriber operators). The refresh requires this readable catalog,
+#            pins fresh routing, RPKI, registry, cloud, VPN and label evidence,
+#            and publishes the augmented database.
+# (optional) ARIN_RELAY_GEOFEEDS=1 also pins the Apple Private Relay and
+#            Cloudflare egress geofeeds as reviewed VPN address lists
 # (optional) SLACK_WEBHOOK
 # (optional) WARP_SKIP_DEPLOY set to skip deployment
+# (optional) BUILD_URIO_CHANGELOG=0 skips the local-Git release-body
+#            and store notes; unset or 1 generates them
+# The ur.io changelog and desktop release metadata are committed inputs.
+# Refresh them separately from this build; no GitHub metadata API walk runs here.
+# (optional) SDK registry credentials: NPM_TOKEN (or existing npm login),
+#            TWINE_PASSWORD/PYPI_TOKEN, NUGET_API_KEY, GEM_HOST_API_KEY,
+#            CARGO_REGISTRY_TOKEN, MAVEN_CENTRAL_USERNAME/PASSWORD plus
+#            SDK_GPG_KEY_ID, SDK_SWIFT_GIT_TOKEN, COCOAPODS_TRUNK_TOKEN.
+#            CONAN_LOGIN_USERNAME + CONAN_PASSWORD + SDK_CONAN_REMOTE_URL,
+#            SDK_VCPKG_GIT_TOKEN. A registry without credentials is skipped.
+#            See sdk/PACKAGEMANAGERS.md.
+# (optional) NPM_PACKAGE_READY_MAX_ATTEMPTS and
+#            NPM_PACKAGE_READY_RETRY_DELAY_SECONDS override the bounded exact
+#            package/tarball propagation wait (defaults: 60 attempts, 10s).
+# (optional) NPM_INSTALL_READY_MAX_ATTEMPTS and
+#            NPM_INSTALL_READY_RETRY_DELAY_SECONDS override the bounded install
+#            retry for exact, freshly published dependencies (defaults: 6
+#            attempts, 10s).
 # (optional) CONNECT_IP_UPDATE set (non-empty) to regenerate the connect IP
-#            tables (security + blocker) from the live feeds before the tests
+#            tables (security, with the Meta prefixes of the WhatsApp
+#            exception, + blocker) from their live sources before the tests
 #            run, then push them to connect main (commit message stamped with
 #            the release version) before the version branches are cut
 # (optional) BUILD_APPLE_IDENTITY set (non-empty) to create a per-run apple
 #            signing keychain from ~/.identity.p12 + ~/.p12-pw (see the
 #            keychain note below and REMOTEBUILD.md option 1)
+# The macOS direct-download build (manual Developer ID signing) also needs the
+# three Developer ID provisioning profiles in ~/.provisionprofiles/ on the build
+# host (see the provisioning profile note at macos_install_provisioning_profiles).
 #
 # The Windows build image is built once, out of band, by build/all/windows/setup.sh
 # (which takes the Windows 11 ARM64 + virtio-win ISOs). run.sh only boots that image
@@ -23,8 +56,8 @@
 # The apple stages need a signing keychain that is unlocked *in this build's own
 # login session*: keychain unlock state is scoped to the audit session that ran
 # the unlock, so an unlock from any other ssh session is invisible here, CodeSign
-# fails with `errSecInternalComponent`, the ios/macos archives are skipped, and
-# the release then hard-fails uploading the missing .ipa. See REMOTEBUILD.md for
+# fails with `errSecInternalComponent`, and the required ios/macos build fails
+# the release immediately. See REMOTEBUILD.md for
 # the full analysis and the ranked options.
 # With BUILD_APPLE_IDENTITY set, this script creates a throwaway per-run build
 # keychain (REMOTEBUILD.md option 1): it imports ~/.identity.p12 (passphrase in
@@ -46,6 +79,139 @@
 #       docker system prune
 
 
+# Check the complete host toolchain before this script pulls repositories,
+# creates a signing keychain, installs an NDK, or performs any other mutation.
+# Keep this list in sync with the host-side commands used here and by the
+# build scripts this runner invokes. Tools installed by this runner itself
+# (currently osv-scanner and warpctl), or inside a purpose-built container
+# (including flatpak/flatpak-builder), do not belong in this list.
+required_build_tools=(
+    bash
+    codesign
+    curl
+    docker
+    ffprobe
+    geoipupdate
+    git
+    go
+    gsed
+    hdiutil
+    java
+    jq
+    make
+    mktemp
+    nc
+    node
+    npm
+    npx
+    openssl
+    pandoc
+    pip
+    productbuild
+    productsign
+    python
+    python3
+    qemu-img
+    qemu-system-aarch64
+    realpath
+    rsync
+    scp
+    sdkmanager
+    security
+    shasum
+    ssh
+    ssh-keygen
+    tar
+    timeout
+    unzip
+    xcodebuild
+    xcrun
+    zip
+    zig
+)
+if [ "$BUILD_TEST" ]; then
+    # The acceptance phase and the SDK variant smoke scripts use these host
+    # tools. Keep the checks here so a test build fails before the local test
+    # environment or any SDK package work starts.
+    required_build_tools+=(
+        cargo
+        clang++
+        gem
+        gobind
+        gomobile
+        install_name_tool
+        lsof
+        mvn
+        otool
+        pkill
+        ruby
+        sudo
+        swift
+    )
+fi
+
+# Optional package managers only require their tools when publication is enabled.
+# C# uses the shared SDK/version/architecture probe below; dotnet@8 is keg-only
+# on Homebrew and does not have to be on the shell's PATH.
+if [ "$CARGO_REGISTRY_TOKEN" ]; then required_build_tools+=(cargo); fi
+if [ "$GEM_HOST_API_KEY" ]; then required_build_tools+=(ruby gem); fi
+if [ "$MAVEN_CENTRAL_USERNAME" ] && [ "$MAVEN_CENTRAL_PASSWORD" ] && [ "$SDK_GPG_KEY_ID" ]; then
+    required_build_tools+=(mvn javadoc gpg)
+fi
+if [ "$SDK_SWIFT_GIT_TOKEN" ] || [ "$COCOAPODS_TRUNK_TOKEN" ]; then required_build_tools+=(swift); fi
+if [ "$SDK_VCPKG_GIT_TOKEN" ] || { [ "$CONAN_LOGIN_USERNAME" ] && [ "$CONAN_PASSWORD" ]; }; then
+    required_build_tools+=(cmake zig)
+fi
+if [ "$COCOAPODS_TRUNK_TOKEN" ]; then required_build_tools+=(pod); fi
+
+missing_build_tools=()
+for build_tool in "${required_build_tools[@]}"; do
+    if ! command -v "$build_tool" >/dev/null 2>&1; then
+        missing_build_tools+=("$build_tool")
+    fi
+done
+if [ -z "$NVM_DIR" ] || [ ! -r "$NVM_DIR/nvm.sh" ]; then
+    missing_build_tools+=("nvm (set NVM_DIR to a readable nvm installation)")
+fi
+if (( ${#missing_build_tools[@]} )); then
+    echo "Missing required build tool(s):" >&2
+    printf '  - %s\n' "${missing_build_tools[@]}" >&2
+    echo "Install every missing tool before running build/all/run.sh." >&2
+    exit 1
+fi
+
+if [[ ! `go version` =~ 'go version go1.27.2' ]]; then
+    echo 'go 1.27.2 required' >&2
+    exit 1
+fi
+if [ "$NUGET_API_KEY" ] || [ "$BUILD_TEST" ]; then
+    if ! go -C "$WARP_HOME/sdk/packaging" run . check-tools csharp; then
+        echo "NuGet build tools are not ready. Run make -C \"$WARP_HOME/sdk/csharp\" init before starting the release." >&2
+        exit 1
+    fi
+fi
+if [[ ! `java -version 2>&1` =~ 'openjdk version "21.0.' ]]; then
+    echo 'java 21.0.x required' >&2
+    exit 1
+fi
+if [[ ! `node --version 2>&1` =~ 'v24.14.1' ]]; then
+    echo 'node 24.14.1 required' >&2
+    exit 1
+fi
+if [[ ! `npm --version 2>&1` =~ '11.11.0' ]]; then
+    echo 'npm 11.11.0 required' >&2
+    exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+    echo 'Docker is required and its daemon must be running.' >&2
+    exit 1
+fi
+if ! xcodebuild -version >/dev/null 2>&1; then
+    echo 'A working Xcode command-line toolchain is required.' >&2
+    exit 1
+fi
+
+
 builder_message () {
     echo -n "$1\n"
     if [ "$SLACK_WEBHOOK" ]; then
@@ -62,15 +228,233 @@ error_trap () {
     fi
 }
 
-warn_trap () {
-    code=$?
-    if [ $code != 0 ]; then
-        builder_message "warning($code): $1. Build will continue."
+# Require concrete nonempty outputs even when a component reports success.
+require_build_artifacts () {
+    if [ "$#" -eq 0 ]; then
+        builder_message "error: required build artifact set is empty"
+        return 1
+    fi
+    local artifact
+    for artifact in "$@"; do
+        if [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
+            builder_message "error: required build artifact is missing or empty: $artifact"
+            return 1
+        fi
+    done
+}
+
+# The "Developer ID Application" identity that signs the macOS direct-download
+# DMG, printed as its SHA-1 so codesign never sees an ambiguous name. Fails with
+# a clear message when the signing keychains have none (the smoke expectation:
+# `security find-identity -v -p codesigning | grep -q "Developer ID Application"`).
+macos_developer_id_identity () {
+    local identity
+    identity=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -n 1 | awk '{ print $2 }')
+    if [ ! "$identity" ]; then
+        builder_message "error: no 'Developer ID Application' identity in the signing keychains, so the macOS direct-download DMG cannot be signed. Assemble ~/.identity-devid.p12 with all/make-apple-dist-identity.sh developer-id <developer-id-application.cer> (Account Holder creates the certificate) and rerun (REMOTEBUILD.md)" >&2
+        return 1
+    fi
+    echo "$identity"
+}
+
+# Developer ID provisioning profiles for the macOS direct-download build. The
+# URnetworkDirect scheme signs MANUALLY (apple/app/ExportOptions-DeveloperID.plist
+# is signingStyle manual with a provisioningProfiles map), so its xcodebuild
+# archive/export never talk to the portal (no -allowProvisioningUpdates): the
+# three Developer ID profiles must already be installed on the build host. They
+# live in ~/.provisionprofiles/ (one .provisionprofile each, chmod 600) and are
+# copied at startup (macos_install_provisioning_profiles) into Xcode's profile
+# directory under their UUID. Required profiles, by their portal Name:
+#   "URnetwork Download"              -> com.bringyour.urnetwork
+#   "URnetwork Extension Download"    -> com.bringyour.urnetwork.extension
+#   "URnetwork Split Tunnel Download" -> com.bringyour.urnetwork.splittunnel
+# To (re)generate one in the Apple developer portal: Certificates, Identifiers
+# & Profiles -> Profiles -> + -> Distribution: "Developer ID" -> pick the App ID
+# above -> pick the "Developer ID Application" certificate (the one assembled
+# by all/make-apple-dist-identity.sh developer-id) -> name it exactly as above
+# -> download the .provisionprofile into ~/.provisionprofiles/ on this host.
+# Profiles expire (yearly). The gate below (macos_require_direct_profiles)
+# fails the build before anything is built when any profile is missing,
+# expired, or was not issued for the Developer ID Application identity.
+MACOS_DIRECT_PROFILE_NAMES=("URnetwork Download" "URnetwork Extension Download" "URnetwork Split Tunnel Download")
+MACOS_PROFILES_SOURCE_DIR="$HOME/.provisionprofiles"
+MACOS_PROFILES_INSTALL_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+
+# macos_profile_value <plist> <key> — one value of a decoded profile (empty when
+# the key is missing; an array key prints its length)
+macos_profile_value () {
+    plutil -extract "$2" raw -o - "$1" 2>/dev/null
+}
+
+# macos_profile_problem <file> <plist-out> — decode a CMS-signed provisioning
+# profile into <plist-out> and print why it is unusable: not a profile, no
+# UUID/ExpirationDate, or expired. Prints nothing for a valid, unexpired one.
+macos_profile_problem () {
+    local profile="$1" plist="$2" uuid expires
+    if ! security cms -D -i "$profile" > "$plist" 2>/dev/null; then
+        echo "$profile is not a CMS-signed provisioning profile (security cms -D failed)"
+        return
+    fi
+    uuid=$(macos_profile_value "$plist" UUID)
+    expires=$(macos_profile_value "$plist" ExpirationDate)
+    if [ ! "$uuid" ] || [ ! "$expires" ]; then
+        echo "$profile decodes without a UUID/ExpirationDate, so it is not a provisioning profile"
+        return
+    fi
+    if [[ ! "$expires" > "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ]]; then
+        echo "provisioning profile $profile (\"$(macos_profile_value "$plist" Name)\") expired on $expires"
+        return
     fi
 }
 
+# macos_profile_signs_with <plist> <identity-sha1> — true when one of the
+# profile's DeveloperCertificates is the certificate behind that identity
+# (`security find-identity` prints the SHA-1 of the certificate DER).
+macos_profile_signs_with () {
+    local plist="$1" identity="$2" count i cert_sha1
+    count=$(macos_profile_value "$plist" DeveloperCertificates)
+    for (( i = 0; i < ${count:-0}; i++ )); do
+        cert_sha1=$(macos_profile_value "$plist" "DeveloperCertificates.$i" | base64 -d 2>/dev/null | shasum -a 1 | awk '{ print toupper($1) }')
+        if [ "$cert_sha1" = "$identity" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Install every ~/.provisionprofiles/*.provisionprofile into Xcode's profile
+# directory as <UUID>.provisionprofile, failing on the first file that is not
+# a valid, unexpired profile (the message names the file).
+macos_install_provisioning_profiles () {
+    local profile plist problem uuid
+    plist=$(mktemp) || return 1
+    mkdir -p "$MACOS_PROFILES_INSTALL_DIR" || { rm -f "$plist"; return 1; }
+    for profile in "$MACOS_PROFILES_SOURCE_DIR"/*.provisionprofile(N); do
+        problem=$(macos_profile_problem "$profile" "$plist")
+        if [ "$problem" ]; then
+            builder_message "error: $problem; regenerate it in the portal (see the provisioning profile note in all/run.sh) and replace it in $MACOS_PROFILES_SOURCE_DIR/"
+            rm -f "$plist"
+            return 1
+        fi
+        uuid=$(macos_profile_value "$plist" UUID)
+        cp "$profile" "$MACOS_PROFILES_INSTALL_DIR/$uuid.provisionprofile" || { rm -f "$plist"; return 1; }
+        echo "installed provisioning profile \"$(macos_profile_value "$plist" Name)\" ($uuid) from $profile"
+    done
+    rm -f "$plist"
+}
+
+# macos_require_direct_profiles <identity-sha1> — every MACOS_DIRECT_PROFILE_NAMES
+# profile is installed, unexpired, and issued for the Developer ID Application
+# identity that signs the build. A corrupt installed .provisionprofile fails
+# outright; an expired or foreign-certificate copy of a required name only
+# fails when no valid copy of that name is installed.
+macos_require_direct_profiles () {
+    local identity="$1" profile plist problem name
+    local -A found problems
+    plist=$(mktemp) || return 1
+    for profile in "$MACOS_PROFILES_INSTALL_DIR"/*.provisionprofile(N); do
+        problem=$(macos_profile_problem "$profile" "$plist")
+        case "$problem" in
+            *"security cms -D failed"*|*"not a provisioning profile"*)
+                builder_message "error: $problem; remove it from $MACOS_PROFILES_INSTALL_DIR"
+                rm -f "$plist"
+                return 1
+                ;;
+        esac
+        name=$(macos_profile_value "$plist" Name)
+        [ "${MACOS_DIRECT_PROFILE_NAMES[(Ie)$name]}" != 0 ] || continue
+        if [ ! "$problem" ] && ! macos_profile_signs_with "$plist" "$identity"; then
+            problem="provisioning profile $profile (\"$name\") was not issued for the Developer ID Application identity $identity"
+        fi
+        if [ "$problem" ]; then
+            problems[$name]="$problem"
+        else
+            found[$name]="$profile"
+        fi
+    done
+    rm -f "$plist"
+    for name in "${MACOS_DIRECT_PROFILE_NAMES[@]}"; do
+        if [ "${found[$name]}" ]; then
+            echo "provisioning profile \"$name\": ${found[$name]}"
+        elif [ "${problems[$name]}" ]; then
+            builder_message "error: ${problems[$name]}; regenerate it in the portal (see the provisioning profile note in all/run.sh), put it in $MACOS_PROFILES_SOURCE_DIR/ and rerun"
+            return 1
+        else
+            builder_message "error: provisioning profile \"$name\" is not installed in $MACOS_PROFILES_INSTALL_DIR, so the macOS direct-download build cannot be signed. Download it from the portal into $MACOS_PROFILES_SOURCE_DIR/ (see the provisioning profile note in all/run.sh) and rerun"
+            return 1
+        fi
+    done
+}
+
+# Mirror the existing Windows architecture plan, not a nullglob-derived subset.
+require_windows_artifacts () {
+    local output_directory="$1" version="$2" suffix
+    local -a suffixes
+    case "${WINDOWS_BUILD_ARCHITECTURES:-amd64,arm64}" in
+        amd64,arm64) suffixes=(x64 arm64) ;;
+        amd64) suffixes=(x64) ;;
+        arm64) suffixes=(arm64) ;;
+        *) builder_message "error: invalid Windows architecture plan"; return 2 ;;
+    esac
+    for suffix in "${suffixes[@]}"; do
+        require_build_artifacts "$output_directory/URnetwork-$version-$suffix.msi" || return $?
+    done
+}
+
+# Every selected Linux role/architecture and the existing single Flatpak are required.
+require_linux_artifacts () {
+    local output_directory="$1" version="$2" architecture package_arch role flatpak_arch
+    local -a architectures roles
+    architectures=(${=${ARCHES:-amd64 arm64}})
+    roles=(${=${ROLES:-daemon gui}})
+    if [ "${#architectures}" -eq 0 ] || [ "${#roles}" -eq 0 ]; then
+        builder_message "error: empty Linux build plan"
+        return 2
+    fi
+    for architecture in "${architectures[@]}"; do
+        case "$architecture" in
+            amd64) package_arch=x86_64 ;;
+            arm64) package_arch=aarch64 ;;
+            *) builder_message "error: invalid Linux architecture plan"; return 2 ;;
+        esac
+        for role in "${roles[@]}"; do
+            case "$role" in
+                daemon)
+                    require_build_artifacts \
+                        "$output_directory/urnetwork-daemon_${version}_${architecture}.deb" \
+                        "$output_directory/urnetwork-daemon-${version}-${architecture}.install.tar.gz" \
+                        "$output_directory/urnetwork-daemon-${version}.${package_arch}.rpm" \
+                        "$output_directory/urnetwork-daemon-${version}-${package_arch}.pkg.tar.zst" || return $?
+                    ;;
+                gui)
+                    # No .AppImage.zsync: the AppImage embeds no update information
+                    # (linux/packaging/make-appimage.sh); the GUI updates through its
+                    # in-app checker against the stable urnetwork/linux releases.
+                    require_build_artifacts \
+                        "$output_directory/URnetwork-${version}-${architecture}.AppImage" || return $?
+                    ;;
+                *) builder_message "error: invalid Linux role plan"; return 2 ;;
+            esac
+        done
+    done
+    flatpak_arch="${ARCH:-}"
+    if [ -z "$flatpak_arch" ]; then
+        case "$(uname -m)" in
+            x86_64) flatpak_arch=amd64 ;;
+            aarch64|arm64) flatpak_arch=arm64 ;;
+            *) builder_message "error: unsupported Flatpak build host"; return 2 ;;
+        esac
+    fi
+    case "$flatpak_arch" in
+        amd64|arm64) ;;
+        *) builder_message "error: invalid Flatpak architecture plan"; return 2 ;;
+    esac
+    require_build_artifacts "$output_directory/URnetwork-${version}-${flatpak_arch}.flatpak"
+}
 
 export BUILD_HOME=`realpath ..`
+# shellcheck source=all/go-mips-env.sh
+source "$BUILD_HOME/all/go-mips-env.sh"
 export BUILD_ENV=main
 export BUILD_SED=gsed
 # -S/--fail-with-body: stay quiet on success, but on HTTP >= 400 fail with a
@@ -82,6 +466,36 @@ export BRINGYOUR_HOME=`realpath ..`
 if [ ! "$STAGE_SECONDS" ]; then
     export STAGE_SECONDS=60
 fi
+
+
+# Release branches refer to versioned URnetwork modules by the tag this run has
+# just pushed. Those repositories are private, so neither proxy.golang.org nor
+# sum.golang.org can resolve a new tag anonymously. Keep the authentication
+# setup process-local: tell Go which module namespaces are private and make the
+# HTTPS URLs emitted by Go's VCS resolver use the SSH credentials already
+# required for every build checkout. GIT_CONFIG_COUNT composes with any caller
+# configuration instead of mutating the builder's global git config.
+configure_private_go_modules () {
+    local private_go_modules='github.com/urnetwork,github.com/urfoundation'
+    export GOPRIVATE="${GOPRIVATE:+${GOPRIVATE},}${private_go_modules}"
+    export GONOPROXY="${GONOPROXY:+${GONOPROXY},}${private_go_modules}"
+    export GONOSUMDB="${GONOSUMDB:+${GONOSUMDB},}${private_go_modules}"
+
+    local git_config_count="${GIT_CONFIG_COUNT:-0}"
+    if [[ ! "$git_config_count" =~ '^[0-9]+$' ]]; then
+        echo "GIT_CONFIG_COUNT must be a non-negative integer, got: $git_config_count" >&2
+        return 1
+    fi
+    export "GIT_CONFIG_KEY_${git_config_count}=url.ssh://git@github.com/urnetwork/.insteadOf"
+    export "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/urnetwork/"
+    (( git_config_count += 1 ))
+    export "GIT_CONFIG_KEY_${git_config_count}=url.ssh://git@github.com/urfoundation/.insteadOf"
+    export "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/urfoundation/"
+    (( git_config_count += 1 ))
+    export GIT_CONFIG_COUNT="$git_config_count"
+}
+configure_private_go_modules
+error_trap 'private Go module access configuration'
 
 
 # Per-run apple signing keychain (BUILD_APPLE_IDENTITY; see the header note and
@@ -114,11 +528,14 @@ if [ "$BUILD_APPLE_IDENTITY" ]; then
         security unlock-keychain -p "$APPLE_IDENTITY_KC_PW" "$APPLE_IDENTITY_KC"
     error_trap 'apple identity keychain create'
     # import every identity on the box (~/.identity.p12 plus optional extras
-    # like ~/.identity-dist.p12 / ~/.identity-installer.p12 — all share the
-    # ~/.p12-pw passphrase; see all/make-apple-dist-identity.sh). The archive
-    # signs with Apple Development; the store export additionally needs Apple
-    # Distribution (and Mac Installer Distribution for the macOS .pkg) when
-    # cloud signing is unavailable.
+    # like ~/.identity-dist.p12 / ~/.identity-installer.p12 /
+    # ~/.identity-devid.p12 — all share the ~/.p12-pw passphrase; see
+    # all/make-apple-dist-identity.sh). The archive signs with Apple
+    # Development; the store export additionally needs Apple Distribution (and
+    # Mac Installer Distribution for the macOS .pkg) when cloud signing is
+    # unavailable; the macOS direct-download DMG needs Developer ID
+    # Application (find-identity below must list it, see
+    # macos_developer_id_identity).
     for identity_p12 in "$HOME"/.identity*.p12; do
         security import "$identity_p12" -P "$(cat ~/.p12-pw)" -f pkcs12 \
             -T /usr/bin/codesign -T /usr/bin/security \
@@ -143,6 +560,22 @@ if [ "$BUILD_APPLE_IDENTITY" ]; then
     rm -f /tmp/apple-identity-smoke
 fi
 
+# The macOS direct-download build signs manually with Developer ID profiles
+# from ~/.provisionprofiles/ (see the provisioning profile note above). Install
+# them into Xcode's profile directory now, validating each file.
+macos_install_provisioning_profiles
+error_trap 'macos direct: provisioning profile install'
+
+# The macOS direct-download DMG (Apple section below) is signed with a
+# "Developer ID Application" identity: ~/.identity-devid.p12 imported above,
+# or one already in the login keychain. Prove it is present, and that every
+# Developer ID profile is installed for it, before spending hours on the
+# builds ahead of it.
+MACOS_DIRECT_IDENTITY=$(macos_developer_id_identity)
+error_trap 'macos direct: Developer ID Application identity'
+macos_require_direct_profiles "$MACOS_DIRECT_IDENTITY"
+error_trap 'macos direct: Developer ID provisioning profiles'
+
 
 git_main () {
     branch_name=main
@@ -150,6 +583,52 @@ git_main () {
         branch_name=$1
     fi
     git diff --quiet && git diff --cached --quiet && git checkout $branch_name && git pull --recurse-submodules
+}
+
+# Generated commits can race an unrelated main push during a long release.
+# Integrate that one observed remote advance and retry once; a persistent push
+# or rebase failure remains fatal to the caller. Do not auto-resolve generated
+# conflicts or stash unrelated working-tree edits.
+git_push_with_rebase_retry () {
+    git push && return 0
+    git pull --rebase || return $?
+    git push
+}
+
+# A pull that drops a submodule cannot remove its checkout (git will not rmdir
+# a populated directory), and the leftover is an untracked nested repository
+# that the release commit's `git add .` records again as a gitlink with no
+# .gitmodules entry, after which every `git submodule update --init` fails.
+# elements went that way: dropped in c1442ac, put back by release fbd5a5c and
+# removed again by hand in 045eb15. Delete such a leftover the way git's own
+# submodule removal does: only a clean checkout whose git directory is this
+# repository's modules/<name>, and that git directory stays, so no commit is
+# lost. A leftover with local changes fails the step for a person to look at.
+remove_retired_submodule_checkouts () {
+    local build_home="$1" modules_dir checkout name gitdir changes
+    local -a listed_paths
+    [ -n "$build_home" ] || return 2
+    modules_dir=$(git -C "$build_home" rev-parse --absolute-git-dir) || return $?
+    modules_dir="${modules_dir:A}/modules"
+    if [ -f "$build_home/.gitmodules" ]; then
+        listed_paths=(${(f)"$(git config --file "$build_home/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{print $2}')"})
+    fi
+    for checkout in "$build_home"/*(N/); do
+        name=${checkout:t}
+        [ -f "$checkout/.git" ] || continue
+        [ "${listed_paths[(Ie)$name]}" = 0 ] || continue
+        [ -z "$(git -C "$build_home" ls-files -- "$name")" ] || continue
+        gitdir=$(git -C "$checkout" rev-parse --absolute-git-dir 2>/dev/null) || continue
+        gitdir=${gitdir:A}
+        [[ "$gitdir" = "$modules_dir"/* ]] || continue
+        changes=$(git -C "$checkout" status --porcelain) || return $?
+        if [ "$changes" ]; then
+            builder_message "error: $checkout is the checkout of a submodule that .gitmodules no longer lists, and it has local changes. Save what you need, delete the directory and rerun."
+            return 1
+        fi
+        rm -rf -- "$checkout" || return $?
+        echo "removed the checkout of retired submodule $name (its git directory stays at $gitdir)"
+    done
 }
 
 (cd $WARP_HOME/config && git_main)
@@ -162,6 +641,7 @@ error_trap 'pull warp release'
 
 if [ "$BUILD_RESET" ]; then
     (cd $BUILD_HOME && rm -rf connect)
+    (cd $BUILD_HOME && rm -rf gvisor)
     (cd $BUILD_HOME && rm -rf sdk)
     (cd $BUILD_HOME && rm -rf android)
     (cd $BUILD_HOME && rm -rf apple)
@@ -170,7 +650,6 @@ if [ "$BUILD_RESET" ]; then
     (cd $BUILD_HOME && rm -rf sn)
     (cd $BUILD_HOME && rm -rf server)
     (cd $BUILD_HOME && rm -rf web)
-    (cd $BUILD_HOME && rm -rf docs)
     (cd $BUILD_HOME && rm -rf warp)
     (cd $BUILD_HOME && rm -rf glog)
     (cd $BUILD_HOME && rm -rf proxy)
@@ -199,6 +678,8 @@ BUILD_PRE_COMMIT=`cd $BUILD_HOME && git log -1 --format=%H`
     git pull --rebase &&
     git submodule update --init --recursive)
 error_trap 'pull'
+remove_retired_submodule_checkouts "$BUILD_HOME"
+error_trap 'remove retired submodule checkouts'
 BUILD_COMMIT=`cd $BUILD_HOME && git log -1 --format=%H`
 if [ "$BUILD_PRE_COMMIT" != "$BUILD_COMMIT" ]; then
     builder_message "Build repo updated. Must restart to use the latest script."
@@ -210,26 +691,29 @@ ANDROID_NDK_VERSION=29.0.14206865
 sdkmanager "ndk;$ANDROID_NDK_VERSION"
 error_trap 'android ndk'
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
-if [[ ! `go version` =~ 'go version go1.26.6' ]]; then
-    builder_message 'go 1.26.6 required'
-    exit 1
-fi
-if [[ ! `java -version 2>&1` =~ 'openjdk version "21.0.' ]]; then
-    builder_message 'java 21.0.x required'
-    exit 1
-fi
-if [[ ! `node --version 2>&1` =~ 'v24.14.1' ]]; then
-    builder_message 'node 24.14.1 required'
-    exit 1
-fi
-if [[ ! `npm --version 2>&1` =~ '11.11.0' ]]; then
-    builder_message 'npm 11.11.0 required'
-    exit 1
-fi
 
 
 (cd $BUILD_HOME/connect && git_main)
 error_trap 'pull connect'
+# gVisor's Go-consumable source lives on the fork's go branch. Keep its
+# module/import path gvisor.dev/gvisor; release consumers use an immutable
+# fork revision, while local checkouts replace it with this sibling source.
+(cd $BUILD_HOME/gvisor && git_main go)
+error_trap 'pull gvisor go'
+# The development modules replace gvisor.dev/gvisor with the sibling checkout.
+# Published release modules cannot retain a local-path replace: resolve the
+# exact checked-out fork commit to an immutable Go pseudo-version instead.
+GVISOR_COMMIT=$(git -C "$BUILD_HOME/gvisor" rev-parse HEAD)
+GVISOR_COMMIT_SHORT=$(git -C "$BUILD_HOME/gvisor" rev-parse --short=12 HEAD)
+GVISOR_GO_VERSION=$(GOWORK=off GOPROXY=direct go list -m -f '{{.Version}}' "github.com/urnetwork/gvisor@$GVISOR_COMMIT")
+error_trap 'query immutable gvisor go revision'
+case "$GVISOR_GO_VERSION" in
+    *-"$GVISOR_COMMIT_SHORT") ;;
+    *) false ;;
+esac
+error_trap 'match immutable gvisor go revision'
+test "$(head -n 1 "$BUILD_HOME/gvisor/go.mod")" = 'module gvisor.dev/gvisor'
+error_trap 'verify gvisor module path'
 (cd $BUILD_HOME/sdk && git_main)
 error_trap 'pull sdk'
 (cd $BUILD_HOME/android && git_main)
@@ -246,8 +730,6 @@ error_trap 'pull sn'
 error_trap 'pull server'
 (cd $BUILD_HOME/web && git_main)
 error_trap 'pull web'
-(cd $BUILD_HOME/docs && git_main)
-error_trap 'pull docs'
 (cd $BUILD_HOME/warp && git_main)
 error_trap 'pull warp'
 (cd $BUILD_HOME/glog && git_main master)
@@ -262,9 +744,13 @@ error_trap 'pull goidenticons'
 error_trap 'pull extension'
 (cd $BUILD_HOME/localizations && git_main)
 error_trap 'pull localizations'
+(cd $WARP_HOME/mmm && git_main)
+error_trap 'pull mmm'
 
-# refresh the generated connect IP tables from the live threat feeds:
-# security/main.go -> ip_security_cfaa_block.go, blocker/main.go -> ip_blocker_block.go.
+# refresh the generated connect IP tables from their live sources:
+# security/main.go -> ip_security_cfaa_block.go (threat feeds) and
+# ip_security_messaging_meta.go (Meta's AS32934 prefixes for the WhatsApp
+# exception, from RADb over whois, TCP 43), blocker/main.go -> ip_blocker_block.go.
 # Runs while every repo is still on main so the tests below exercise the update.
 # The commit + push to connect main happens after the release version is staged
 # (the commit message carries it) and before the version branches are cut — see
@@ -276,6 +762,31 @@ if [ "$CONNECT_IP_UPDATE" ]; then
         go run ./blocker)
     error_trap 'connect ip update'
 fi
+
+# Consume the committed ur.io changelog and desktop download metadata.
+# Their standalone generators query GitHub and belong to separate maintenance;
+# a release build must not spend API requests refreshing these inputs.
+builder_message "using committed ur.io changelog and desktop release metadata"
+
+# The site must not ship a /changelog older than the desktop release it
+# advertises: the gate fails when LATEST_VERSION trails the newest stable
+# platform release in DESKTOP_RELEASE (skipped while there is none) or the
+# newest entry is more than 14 days behind it (ALLOW_STALE_CHANGELOG=1 overrides).
+(cd $WARP_HOME/mmm/ur.io && node react/scripts/check-changelog-fresh.mjs)
+error_trap 'ur.io changelog freshness'
+
+# The per-URL content-date record (sitemap lastmod + dateModified) is derived
+# from the docs, country data and API spec and committed with them; regenerate
+# it here so the release commit below carries the record its build checks.
+# The page dates (react/src/data/page-dates.js) come from the git history of
+# each page's sources. The web build's prebuild regenerates them too, so a
+# stale committed module would leave this checkout dirty after the build and
+# block the next release's pull; regenerate and commit them here as well.
+(cd $WARP_HOME/mmm/ur.io &&
+    node react/scripts/generate-docs.mjs &&
+    node react/scripts/content-dates.mjs &&
+    node react/scripts/generate-page-dates.mjs)
+error_trap 'ur.io content dates update'
 
 # regenerate every app's strings from the shared localization store:
 # localizations/keys/*.yaml -> android res/values*, apple Localizable.xcstrings,
@@ -292,6 +803,39 @@ builder_message "generating app localizations from the shared store"
     npm ci --silent &&
     URNETWORK_ROOT="$BUILD_HOME" npm run gen)
 error_trap 'localizations codegen'
+
+# Build both sites with their complete check batteries before any app or
+# service release work. The final web build regenerates release artifacts but
+# does not repeat these checks. Bind the site's locale generator to this run's
+# localization checkout, including when mmm lives outside BUILD_HOME.
+builder_message "checking web builds after localization updates"
+(cd "$BUILD_HOME/web/web" && URNETWORK_ROOT="$BUILD_HOME" make check)
+error_trap 'web build checks'
+
+# Gradle evaluates Android's version fields even for dependency reports and
+# reads them through the sibling warpctl binary. Bootstrap that fresh checkout
+# before the license gate; allocate the new release only after all gates pass.
+(cd $BUILD_HOME/warp/warpctl && make)
+error_trap 'build bootstrap warpctl'
+export PATH="$BUILD_HOME/warp/warpctl/build/darwin/arm64:$PATH"
+if [[ ! `which warpctl` = "$BUILD_HOME/warp/warpctl/build/darwin/arm64/warpctl" ]]; then
+    builder_message "Build warpctl is not first on the PATH ($(which warpctl))."
+    exit 1
+fi
+
+# license list gate: sdk/license.yml is embedded in the SDK and shown under
+# Account -> Settings -> Licenses in every app, so it must list every dependency
+# each app ships. -check recollects each app's dependencies offline (gradle
+# runtime classpaths, Package.resolved, the npm lockfiles, the SDK's Go modules)
+# from the sibling checkouts and fails on anything missing or stale. The fix is
+# `go run ./licenses` in the sdk repo and a commit of license.yml. The site
+# checkout lives under WARP_HOME, outside the build repository's siblings.
+builder_message "checking the license list against every app's dependencies"
+(cd $BUILD_HOME/sdk &&
+    for target in sdk android apple web extension; do
+        go run ./licenses -check "$target" -mmm-dir "$WARP_HOME/mmm" || exit $?
+    done)
+error_trap 'license list check'
 
 # Dependency vulnerability gate. osv-scanner reports what the OSV database knows
 # about every module in the dependency graph; this fails the build on CRITICAL or
@@ -442,6 +986,22 @@ if [ "$BUILD_TEST" ]; then
         fi
     done
 
+    # SDK package variants live below the SDK checkout, so they are not found
+    # by the top-level repository test loop above. Run every checked-in variant
+    # entry point explicitly; each script performs its own native/package smoke
+    # and exits non-zero on a load or consumer failure.
+    sdk_test_platforms=(cgo js python ruby rust java kotlin swift csharp)
+    for sdk_platform in "${sdk_test_platforms[@]}"; do
+        sdk_test="$BUILD_HOME/sdk/$sdk_platform/test.sh"
+        if [[ ! -x "$sdk_test" ]]; then
+            builder_message "error: missing executable SDK test script: sdk/$sdk_platform/test.sh"
+            exit 1
+        fi
+        (cd "$BUILD_HOME/sdk/$sdk_platform" && ./test.sh)
+        error_trap "sdk/$sdk_platform tests"
+        builder_message "sdk/$sdk_platform tests passed."
+    done
+
     # Tests done — stop the local environment and re-arm the apple identity
     # cleanup as the EXIT trap (a no-op when BUILD_APPLE_IDENTITY is unset).
     builder_message "stopping local test environment"
@@ -451,14 +1011,6 @@ if [ "$BUILD_TEST" ]; then
     builder_message "Build all test candidate passed. A version number can now be assigned."
 fi
 
-
-(cd $BUILD_HOME/warp/warpctl && make)
-error_trap 'build bootstrap warpctl'
-export PATH="$BUILD_HOME/warp/warpctl/build/darwin/arm64:$PATH"
-if [[ ! `which warpctl` = "$BUILD_HOME/warp/warpctl/build/darwin/arm64/warpctl" ]]; then
-    builder_message "Build warpctl is not first on the PATH ($(which warpctl))."
-    exit 1
-fi
 
 warpctl stage version next release --message="$HOST build all"
 error_trap 'warpctl stage version'
@@ -474,10 +1026,12 @@ error_trap 'warpctl stage version'
 # Within the binaries we still use the "+".
 
 
-export WARP_VERSION_BASE=`warpctl ls version`
+WARP_VERSION_BASE=$(warpctl ls version)
 error_trap 'warpctl version'
-export WARP_VERSION_CODE=`warpctl ls version-code`
+export WARP_VERSION_BASE
+WARP_VERSION_CODE=$(warpctl ls version-code)
 error_trap 'warpctl version code'
+export WARP_VERSION_CODE
 GO_MOD_VERSION=`echo $WARP_VERSION_BASE | $BUILD_SED 's/\([^\.]*\).*/\1/'`
 if [ $GO_MOD_VERSION = 0 ] || [ $GO_MOD_VERSION = 1 ]; then
     GO_MOD_SUFFIX=''
@@ -502,16 +1056,31 @@ builder_message "Build all \`${EXTERNAL_WARP_VERSION}\`"
 
 # push the connect IP table update (generated before the tests above) to connect
 # main, stamped with the release version, before the version branches below are
-# cut from it. Stage only the generated tables, never a blanket add.
+# cut from it. Stage only the generated tables, never a blanket add; a table
+# left out would stay modified and fail the next build's connect pull.
 if [ "$CONNECT_IP_UPDATE" ]; then
     (cd $BUILD_HOME/connect &&
-        git add ip_security_cfaa_block.go ip_blocker_block.go &&
+        git add ip_security_cfaa_block.go ip_security_messaging_meta.go ip_blocker_block.go &&
         if ! git diff --cached --quiet; then
             git commit -m "${EXTERNAL_WARP_VERSION} ip security and blocker update" &&
-            git push
+            git_push_with_rebase_retry
         fi)
     error_trap 'connect ip update push'
 fi
+
+
+# Push the content and page dates generated before the tests to mmm main,
+# stamped with the release version. The changelog and desktop release metadata
+# are maintained separately and must not be staged by this build.
+(cd $WARP_HOME/mmm &&
+    git add \
+        ur.io/react/src/data/content-dates.js \
+        ur.io/react/src/data/page-dates.js &&
+    if ! git diff --cached --quiet; then
+        git commit -m "${EXTERNAL_WARP_VERSION} ur.io content and page dates update" &&
+        git_push_with_rebase_retry
+    fi)
+error_trap 'ur.io content and page dates update push'
 
 
 # push the regenerated localizations (generated before the tests above) to each
@@ -524,28 +1093,28 @@ fi
     git add 'app/app/src/main/res/values*/strings.xml' &&
     if ! git diff --cached --quiet; then
         git commit -m "${EXTERNAL_WARP_VERSION} localizations update" &&
-        git push
+        git_push_with_rebase_retry
     fi)
 error_trap 'android localizations push'
 (cd $BUILD_HOME/apple &&
     git add app/network/Shared/Resources/Localizable.xcstrings &&
     if ! git diff --cached --quiet; then
         git commit -m "${EXTERNAL_WARP_VERSION} localizations update" &&
-        git push
+        git_push_with_rebase_retry
     fi)
 error_trap 'apple localizations push'
 (cd $BUILD_HOME/windows &&
     git add app/src/App/Strings &&
     if ! git diff --cached --quiet; then
         git commit -m "${EXTERNAL_WARP_VERSION} localizations update" &&
-        git push
+        git_push_with_rebase_retry
     fi)
 error_trap 'windows localizations push'
 (cd $BUILD_HOME/linux &&
     git add app/po &&
     if ! git diff --cached --quiet; then
         git commit -m "${EXTERNAL_WARP_VERSION} localizations update" &&
-        git push
+        git_push_with_rebase_retry
     fi)
 error_trap 'linux localizations push'
 
@@ -568,8 +1137,6 @@ error_trap 'sn prepare version branch'
 error_trap 'server prepare version branch'
 (cd $BUILD_HOME/web && git checkout -b v${EXTERNAL_WARP_VERSION})
 error_trap 'web prepare branch'
-(cd $BUILD_HOME/docs && git checkout -b v${EXTERNAL_WARP_VERSION})
-error_trap 'docs prepare branch'
 (cd $BUILD_HOME/warp && git checkout -b v${EXTERNAL_WARP_VERSION})
 error_trap 'warp prepare branch'
 (cd $BUILD_HOME/glog && git checkout -b v${EXTERNAL_WARP_VERSION})
@@ -602,12 +1169,189 @@ warp.version_code=$WARP_VERSION_CODE
 error_trap 'android edit settings'
 
 
-# metadata
-# copy the pending change log into place if it exists
-if [ -e "$BUILD_HOME/metadata/en-US/changelogs/pending.txt" ]; then
+# metadata -- THE STORE CHANGELOG
+#
+# What this replaced: a straight `cp pending.txt <version code>.txt`. pending.txt
+# is a static one-liner that nobody has edited in months, so every changelog this
+# repo has ever published is byte-identical -- 1025763520, 1025613560, 1025339670
+# and 1025223880 all read "- Bug and performance fixes.". all/changelog.py builds
+# the note out of the actual commits between the last release's submodule pins and
+# the ones this release is about to tag. `--to worktree` because at this point in
+# the run the new release is not committed or tagged yet: every submodule is
+# sitting on the main HEAD it was pulled to, which is exactly what will be pinned.
+#
+# 500 CHARACTERS, and the generator does the trimming, not the store. fdroidserver
+# sets char_limits['whatsNew'] = 500 and update.py slices `text[:limit]` with no
+# warning and no error, so an over-long note is published cut mid-sentence and
+# nothing anywhere says so. Play's cap is the same 500 and it rejects rather than
+# truncates. The generator packs whole bullets inside that budget; nothing here
+# can produce a half-sentence.
+#
+# pending.txt keeps its job. If somebody wrote a headline for this release it goes
+# above the generated bullets (--lede); if it still holds the shipped placeholder
+# text the generator ignores it and says so on stderr.
+#
+# When enabled, the attempted generator and its requested release inputs are
+# required. Failed generation must not silently substitute pending.txt or earlier
+# generated notes. BUILD_URIO_CHANGELOG=0 skips this generator only; the ur.io
+# website consumes separately maintained metadata. This generator uses local Git
+# and has a hard zero-request API budget, independent of the exported token.
+#
+# THE ABI-SPLIT FILENAMES are the other half of this, and they are why F-Droid
+# shows no changelog for this app at all today. fdroiddata's
+# com.bringyour.network.yml carries `VercodeOperation: ['%c + 2', '%c + 3']`, so
+# F-Droid builds and indexes version codes base+2 and base+3, while this block was
+# writing only <base>.txt. fdroidserver matches changelog files by EXACT filename
+# -- update.py's `f == str(CurrentVersionCode) + '.txt'` and its
+# `int(base) in [b["versionCode"] for b in builds]` -- so 42 of the 45 builds in
+# that recipe have no changelog and f-droid.org renders none. Writing the same
+# text under each offset fixes that with no fdroiddata change needed. The offsets
+# are read from FDROID_VERSION_CODE_OFFSETS rather than hardcoded a third time,
+# because fdroiddata owns them and a third ABI would silently break this again.
+# default.txt is fdroidserver's documented fallback (update.py: used only when no
+# version-specific entry was set, so it can never clobber a real one) and costs one
+# more cp: if the offsets ever drift, F-Droid degrades to a present-but-generic
+# note instead of a blank one.
+FDROID_VERSION_CODE_OFFSETS="${FDROID_VERSION_CODE_OFFSETS:-0 2 3}"
+BUILD_CHANGELOG_STORE="${TMPDIR:-/tmp}/urnetwork-changelog-${EXTERNAL_WARP_VERSION}.txt"
+# exported: github_finalize_release() below reads it, long after this block
+export BUILD_CHANGELOG_FULL="${TMPDIR:-/tmp}/urnetwork-changelog-${EXTERNAL_WARP_VERSION}.md"
+# IN THE REPO, not in TMPDIR, unlike the two above. The android note has a home
+# already (metadata/en-US/changelogs, which F-Droid reads off this repository);
+# the apple, windows and linux notes had nowhere to be, and a note that exists
+# only in a Slack message during the run is a note nobody can find on the day
+# they submit. `git add .` below carries the whole tree into the release commit
+# and the release tag, so every published version can be traced to the exact
+# text that was offered for it.
+# One directory, one file per audience, every file prefixed with the version code
+# so the directory is a browsable per-release archive that sorts chronologically --
+# the same key metadata/en-US/changelogs/<versionCode>.txt already uses. Exported:
+# github_finalize_release() links the _Full.md and inlines the _Simple.txt.
+export BUILD_NOTES_DIR="$BUILD_HOME/changelogs"
+export BUILD_NOTES_PREFIX="$WARP_VERSION_CODE"
+rm -f "$BUILD_CHANGELOG_STORE" "$BUILD_CHANGELOG_FULL"
+error_trap 'clear generated changelog outputs'
+for note_output in Full.md Simple.txt Android.txt Apple.txt Windows.txt Linux.xml; do
+    rm -f "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_$note_output"
+    error_trap 'clear generated release note'
+done
+if [ "${BUILD_URIO_CHANGELOG:-1}" = 1 ]; then
+    builder_message "generating the changelog for \`${EXTERNAL_WARP_VERSION}\`"
+    python3 "$BUILD_HOME/all/changelog.py" \
+        --repo "$BUILD_HOME" \
+        --api-limit 0 \
+        --to worktree \
+        --to-label "v${EXTERNAL_WARP_VERSION}" \
+        --lede "$BUILD_HOME/metadata/en-US/changelogs/pending.txt" \
+        --store-out "$BUILD_CHANGELOG_STORE" \
+        --notes-dir "$BUILD_NOTES_DIR" \
+        --notes-prefix "$BUILD_NOTES_PREFIX" \
+        --full-out "$BUILD_CHANGELOG_FULL"
+    error_trap 'generate changelog'
+    require_build_artifacts "$BUILD_CHANGELOG_STORE" "$BUILD_CHANGELOG_FULL" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Full.md" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Simple.txt" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Android.txt" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Apple.txt" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Windows.txt" \
+        "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Linux.xml"
+    error_trap 'generated changelog artifacts'
+else
+    builder_message "skipping release-body/store changelog generation (BUILD_URIO_CHANGELOG disabled)"
+fi
+if [ "${BUILD_URIO_CHANGELOG:-1}" = 1 ] && [ -s "$BUILD_CHANGELOG_STORE" ]; then
+    # ${=...} so zsh word-splits the offset list; zsh does not split on
+    # whitespace by default the way bash does.
+    for changelog_offset in ${=FDROID_VERSION_CODE_OFFSETS}; do
+        cp \
+            "$BUILD_CHANGELOG_STORE" \
+            "$BUILD_HOME/metadata/en-US/changelogs/$((WARP_VERSION_CODE+changelog_offset)).txt"
+        error_trap 'stage versioned Android changelog'
+    done
     cp \
-        "$BUILD_HOME/metadata/en-US/changelogs/pending.txt" \
-        "$BUILD_HOME/metadata/en-US/changelogs/${WARP_VERSION_CODE}.txt"
+        "$BUILD_CHANGELOG_STORE" \
+        "$BUILD_HOME/metadata/en-US/changelogs/default.txt"
+    error_trap 'stage default Android changelog'
+    # $( ) rather than backticks: this nests a command substitution inside a
+    # double-quoted string that already contains backticks (the Slack code
+    # fence), and backticks cannot nest there. `wc -m` counts CHARACTERS, which
+    # is the unit both stores enforce -- `wc -c` would under-report the moment a
+    # commit subject carries an em dash or a non-ASCII name.
+    builder_message "store changelog ($(wc -m < "$BUILD_CHANGELOG_STORE" | tr -d ' ')/500 chars):
+\`\`\`
+$(cat "$BUILD_CHANGELOG_STORE")
+\`\`\`"
+fi
+
+
+# metadata -- THE OTHER THREE STOREFRONTS
+#
+# The block above handles android, and android alone: 500 characters of plain
+# text, written under the offset filenames F-Droid matches by. The other three
+# stores are not that. Their limits are 4000 (App Store Connect), 1500 (Partner
+# Center) and none at all (AppStream, which is not even text -- it is markup
+# inside urnetwork/linux's metainfo XML, and appstreamcli gates that repo's build
+# on it). changelog.py --notes-dir writes one file per storefront, each in
+# its own format at its own limit; see AUDIENCES in all/changelog.py for the
+# citation behind every one of those numbers.
+#
+# Each file is that app's own changes first, then the shared sdk/connect changes
+# after a boundary marker, so whoever submits can delete the tail in one motion
+# if that store's reviewers do not need it. changelogs/README.md says which
+# field each file is pasted into.
+#
+# NOT UNDER metadata/. That tree belongs to F-Droid: fdroidserver globs
+# `build/[A-Za-z]*/metadata/[a-z][a-z]*` and then os.walk()s it, matching
+# changelog files by bare filename at any depth, so an apple or windows note
+# dropped in there would either overwrite the real en-US note or invent a locale
+# in the F-Droid index. changelogs/ is a sibling and is invisible to that glob.
+#
+# The required generated notes were verified above. Stage each opted-in copy
+# with a checked status rather than reporting a failed copy as success.
+if [ "${BUILD_URIO_CHANGELOG:-1}" = 1 ] && [ -d "$BUILD_NOTES_DIR" ]; then
+    for store_note in \
+        "Android.txt:Play Console -> release notes (pasted by hand), 500 chars. The unattended F-Droid copy is under metadata/en-US/changelogs/" \
+        "Apple.txt:App Store Connect -> What's New in This Version (iOS and macOS), 4000 chars" \
+        "Windows.txt:Partner Center -> Store listings -> What's new in this version, 1500 chars" \
+        "Linux.xml:urnetwork/linux metainfo <release><description>, AppStream XML"
+    do
+        # ${x%%:*} / ${x#*:} rather than `cut`: no subprocess, and the field is
+        # a path that must not be word-split.
+        store_note_path="$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_${store_note%%:*}"
+        require_build_artifacts "$store_note_path"
+        error_trap 'generated storefront note'
+        builder_message "store note ${store_note%%:*} ($(wc -m < "$store_note_path" | tr -d ' ') chars) -- ${store_note#*:}:
+\`\`\`
+$(cat "$store_note_path")
+\`\`\`"
+    done
+
+    # THE LINUX FRAGMENT HAS TO TRAVEL, and it has to travel in the repository
+    # rather than as a build flag. The metainfo is installed by exactly one
+    # channel -- the Flatpak -- and Flathub builds that manifest on ITS OWN
+    # infrastructure, where nothing in this pipeline runs. A meson option passed
+    # from all/linux/build-arch.sh would therefore be absent on the one channel
+    # that ships the file; packaging/flatpak/com.bringyour.network.yml already
+    # documents that trap for -Dapp_version. So the fragment is copied INTO the
+    # linux checkout, where git_commit() (which does `git add .` on the version
+    # branch) carries it to urnetwork/linux the same way app/po already travels.
+    #
+    # ONLY IF THAT REPO HAS OPTED IN. The handshake is the destination file
+    # already existing: urnetwork/linux commits it once, together with the meson
+    # fs.read() that substitutes it into the metainfo template, and from then on
+    # every release refreshes it. Until then this says so and changes nothing --
+    # dropping an unreferenced file into another repository's tree is not this
+    # script's call to make.
+    linux_release_description="$BUILD_HOME/linux/app/packaging/release-description.xml"
+    if [ -s "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Linux.xml" ]; then
+        if [ -e "$linux_release_description" ]; then
+            cp "$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Linux.xml" "$linux_release_description"
+            error_trap 'stage Linux release description'
+            builder_message "linux release description staged into app/packaging/release-description.xml"
+        else
+            builder_message "note: urnetwork/linux has no app/packaging/release-description.xml, so the generated AppStream release description was not staged there. It is in changelogs/${BUILD_NOTES_PREFIX}_Linux.xml in this repo, ready for whoever wires the meson side. Build will continue."
+        fi
+    fi
 fi
 
 
@@ -617,10 +1361,18 @@ go_mod_edit_module () {
 }
 
 go_mod_edit_require () {
-    go mod edit -dropreplace=$1 &&
-    go mod edit -droprequire=$1 &&
+    go_mod_drop_require $1 &&
     go mod edit -require=$1${GO_MOD_SUFFIX}@v${EXTERNAL_WARP_VERSION} &&
     go_edit_require $1
+}
+
+go_mod_edit_gvisor () {
+    go mod edit -replace="gvisor.dev/gvisor=github.com/urnetwork/gvisor@$GVISOR_GO_VERSION"
+}
+
+go_mod_drop_require () {
+    go mod edit -dropreplace=$1 &&
+    go mod edit -droprequire=$1
 }
 
 go_edit_require () {
@@ -631,9 +1383,81 @@ go_edit_require_subpackages () {
     find . \( -iname '*.go' -o -iname 'Makefile' \) -type f -exec $BUILD_SED -i "/\/v[0-9]\+/! s|\"$1\([^\"]*\)\"|\"$1${GO_MOD_SUFFIX}\1\"|g" {} \;
 }
 
-go_mod_fork () {
+go_mod_fork_rebase_local_replaces () {
+    local module_dir="v${GO_MOD_VERSION}"
+    local go_mod_json
+    go_mod_json=$(cd "$module_dir" && go mod edit -json) || return $?
+
+    # The fork moves go.mod one directory deeper. Parent-relative replacements
+    # need to climb one more level and follow any target moved by an earlier
+    # sibling fork. A child-relative replacement only needs rebasing when its
+    # target stayed at the repository root, as happens for a nested module or an
+    # explicitly preserved release tree. Targets that moved with this module
+    # and replacements to module versions retain their original meaning.
+    local local_replaces
+    local_replaces=$(printf '%s\n' "$go_mod_json" | jq -r '
+        .Replace[]?
+        | select(.New.Version == null)
+        | select(
+            .New.Path == "." or
+            .New.Path == ".." or
+            (.New.Path | startswith("./")) or
+            (.New.Path | startswith("../"))
+          )
+        | [
+            (.Old.Path + (if .Old.Version == null then "" else "@" + .Old.Version end)),
+            .New.Path
+          ]
+        | @tsv
+    ') || return $?
+
+    local old_module new_path target_root target_suffix
+    while IFS=$'\t' read -r old_module new_path; do
+        if [ -n "$old_module" ]; then
+            if [[ "$new_path" == "." || "$new_path" == ./* ]]; then
+                # A child target that is still below the versioned module moved
+                # with it. Only a target left beside vNNNN needs a new ../.
+                if [ -e "$module_dir/$new_path" ] || [ -L "$module_dir/$new_path" ]; then
+                    continue
+                fi
+                if [ ! -e "$new_path" ] && [ ! -L "$new_path" ]; then
+                    continue
+                fi
+                if [ "$new_path" = "." ]; then
+                    new_path=".."
+                else
+                    new_path="../${new_path#./}"
+                fi
+            else
+                # A sibling may already have moved its root module and trees
+                # such as SN's third_party into vNNNN. Walk toward that module
+                # root to find the relocated target. Existing nested modules
+                # and preserved trees still resolve at their original paths.
+                if [ ! -f "$new_path/go.mod" ]; then
+                    target_root="$new_path"
+                    target_suffix=""
+                    while [[ "$target_root" == ".." || "$target_root" == ../* ]]; do
+                        if [ -f "$target_root/$module_dir/go.mod" ] && \
+                           [ -f "$target_root/$module_dir$target_suffix/go.mod" ]; then
+                            new_path="$target_root/$module_dir$target_suffix"
+                            break
+                        fi
+                        [ "$target_root" != ".." ] || break
+                        target_suffix="/${target_root##*/}$target_suffix"
+                        target_root="${target_root%/*}"
+                    done
+                fi
+                new_path="../$new_path"
+            fi
+            (cd "$module_dir" && go mod edit "-replace=${old_module}=${new_path}") || return $?
+        fi
+    done <<< "$local_replaces"
+}
+
+go_mod_fork_prepare () {
     if [ $GO_MOD_VERSION != 0 ] && [ $GO_MOD_VERSION != 1 ]; then
-        temp=`mktemp -d` &&
+        local temp
+        temp=`mktemp -d` || return $?
         for f in *; do
             if [ ! -e "$f/go.mod" ] && [ ! -e "$f/v${GO_MOD_VERSION}/go.mod" ]; then
                 fork_dir=1
@@ -643,25 +1467,47 @@ go_mod_fork () {
                     fi
                 done
                 if [[ "$fork_dir" ]]; then
-                    mv "$f" "$temp"
+                    mv "$f" "$temp" || return $?
                 fi
             fi
-        done &&
-        $BUILD_SED -i '/^retract/d' "$temp/go.mod" &&
-        mv "$temp" v${GO_MOD_VERSION} &&
+        done
+        $BUILD_SED -i '/^retract/d' "$temp/go.mod" || return $?
+        mv "$temp" v${GO_MOD_VERSION} || return $?
+        # Arguments naming a top-level tree leave that tree beside the versioned
+        # module (the original behavior above). Arguments containing a slash are
+        # paths within a moved tree; carve those back out after the fork. This is
+        # for repository data that belongs in the release tag but not in the Go
+        # module zip.
+        for t in "$@"; do
+            if [[ "$t" == */* ]] && [ -e "v${GO_MOD_VERSION}/$t" ]; then
+                mkdir -p "${t%/*}" || return $?
+                mv "v${GO_MOD_VERSION}/$t" "$t" || return $?
+            fi
+        done
+        go_mod_fork_rebase_local_replaces || return $?
+    fi
+}
+
+go_mod_fork_tidy () {
+    if [ $GO_MOD_VERSION != 0 ] && [ $GO_MOD_VERSION != 1 ]; then
         # the go go.sum needs to be updated
         (cd v${GO_MOD_VERSION} && go mod tidy && go get -t ./...)
     fi
 }
 
+go_mod_fork () {
+    go_mod_fork_prepare "$@" &&
+    go_mod_fork_tidy
+}
+
 go_mod_fork_update () {
     if [ $GO_MOD_VERSION != 0 ] && [ $GO_MOD_VERSION != 1 ]; then
         # the go go.sum needs to be updated for the forked mods
-        for f in *; do
-            if [ -e "$f/go.mod" ] && [[ "$f" =~ "^($1)\$" ]]; then
-                (cd $f && go mod tidy && go get -t ./...)
-            fi
-        done
+        if [ ! -e "$1/go.mod" ]; then
+            echo "missing forked module: $1/go.mod" >&2
+            return 1
+        fi
+        (cd "$1" && go mod tidy && go get -t ./...)
     fi
 }
 
@@ -675,13 +1521,25 @@ npm_edit_module () {
 # Set this fork's own package version. Defaults to EXTERNAL_WARP_VERSION (a valid
 # npm pre-release version). Pass an explicit version for targets like the browser
 # extension whose manifest must use the bare, store-compatible EXTENSION_VERSION.
+# Optional package/version pairs use the fresh-cache install helper for exact
+# dependencies that this release just published and proved ready.
 npm_fork_version () {
-    local v="${1:-$EXTERNAL_WARP_VERSION}"
+    local v
+    if [ "$#" -gt 0 ]; then
+        v="$1"
+        shift
+    else
+        v="$EXTERNAL_WARP_VERSION"
+    fi
     jq --arg v "$v" '.version = $v' package.json > package.json.2 && mv package.json.2 package.json
     jq --arg v "$v" '.version = $v' package-lock.json > package-lock.json.2 && mv package-lock.json.2 package-lock.json
     jq --arg v "$v" '.packages.[""].version = $v' package-lock.json > package-lock.json.2 && mv package-lock.json.2 package-lock.json
     # update package-lock.json
-    npm install
+    if [ "$#" -gt 0 ]; then
+        "$BUILD_HOME/all/npm-install-ready.zsh" "$@"
+    else
+        npm install
+    fi
 }
 
 npm_fork () {
@@ -702,21 +1560,32 @@ npm_fork_update () {
 
 # note npm publishing requires a build unlike go publishing, which just requires the git tag
 npm_publish () {
+    local package_name="$1"
+    local package_version="$2"
+
     if [ -e "Makefile" ]; then
         make || return $?
     else
         npm ci && npm run build --if-present || return $?
     fi
-    npm publish --tag nightly
+    if [ "$SDK_NPM_PUBLISH" = yes ]; then
+        "$BUILD_HOME/all/npm-publish-ready.zsh" \
+            "$package_name" "$package_version" \
+            npm publish --tag nightly
+    else
+        builder_message "skipping npm publication: no publishing credentials"
+    fi
 }
 
 
 git_commit () {
-    git tag -d v${EXTERNAL_WARP_VERSION}
     git add . &&
     if ! (git diff --quiet && git diff --cached --quiet); then
         git commit -m "${EXTERNAL_WARP_VERSION}" &&
-        git push -u origin v${EXTERNAL_WARP_VERSION}
+        # The SDK makes a second release-branch commit after publishing the
+        # same-named immutable module tag. Spell out the remote heads ref so
+        # Git never has to choose between refs/heads/v... and refs/tags/v....
+        git push -u origin "HEAD:refs/heads/v${EXTERNAL_WARP_VERSION}"
     fi
 }
 
@@ -727,21 +1596,34 @@ git_commit () {
 # silently overwriting it -- this also avoids fighting a published immutable-release
 # tag lock.
 #
-# Pass "recreate" to deliberately move the tag to the current commit. This is only
-# used where the same version is re-tagged within a single run (the sdk re-tags
-# after its fork/lock files are regenerated). The caller must drop the local tag
-# first, which git_commit already does via `git tag -d`.
 git_tag () {
     local tag="v${EXTERNAL_WARP_VERSION}"
-    if [ "$1" = "recreate" ]; then
-        git push --delete origin "refs/tags/$tag" &&
-        git tag -a "$tag" -m "${EXTERNAL_WARP_VERSION}" &&
-        git push origin "refs/tags/$tag"
-    elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-        builder_message "error: tag $tag already exists on origin; refusing to overwrite (a version is published only once). Pass 'recreate' to move it intentionally."
+    if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+        builder_message "error: tag $tag already exists on origin; refusing to overwrite (a version is published only once)."
         return 1
     else
         git tag -a "$tag" -m "${EXTERNAL_WARP_VERSION}" &&
+        git push origin "refs/tags/$tag"
+    fi
+}
+
+# Create and push the F-Droid tag, v<version>-fdroid, on the degoogled commit
+# that v<version>-ungoogle records.
+#
+# F-Droid picks up tags from this repo and verifies its build against the
+# github-flavor APKs in the v<version>, v<version+2> and v<version+3> releases.
+# Those tags and the -ungoogle tag are all pushed BEFORE the builds, so a run
+# that fails part way leaves tags whose releases have no APK. This tag is the
+# stable marker: it is pushed only after every one of those APKs is published,
+# so fdroiddata can track `UpdateCheckMode: Tags .+-fdroid$` and skip the rest.
+git_tag_fdroid () {
+    local tag="v${EXTERNAL_WARP_VERSION}-fdroid"
+    local source_tag="v${EXTERNAL_WARP_VERSION}-ungoogle"
+    if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+        builder_message "error: tag $tag already exists on origin; refusing to overwrite (a version is published only once)."
+        return 1
+    else
+        git tag -a "$tag" -m "${EXTERNAL_WARP_VERSION}-fdroid" "${source_tag}^{commit}" &&
         git push origin "refs/tags/$tag"
     fi
 }
@@ -761,6 +1643,7 @@ error_trap 'glog push branch'
 
 (cd $BUILD_HOME/connect &&
     go_mod_edit_module github.com/urnetwork/connect &&
+    go_mod_edit_gvisor &&
     go_edit_require_subpackages github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_edit_require_subpackages github.com/urnetwork/glog &&
@@ -798,6 +1681,7 @@ error_trap 'goidenticons push branch'
 
 (cd $BUILD_HOME/proxy &&
     go_mod_edit_module github.com/urnetwork/proxy &&
+    go_mod_edit_gvisor &&
     go_edit_require_subpackages github.com/urnetwork/proxy &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_edit_require_subpackages github.com/urnetwork/connect &&
@@ -815,6 +1699,7 @@ error_trap 'proxy push branch'
 
 
 (cd $BUILD_HOME/sdk/build &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/goidenticons &&
@@ -822,6 +1707,7 @@ error_trap 'proxy push branch'
 error_trap 'sdk build edit'
 
 (cd $BUILD_HOME/sdk/cgo &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/goidenticons &&
@@ -829,6 +1715,7 @@ error_trap 'sdk build edit'
 error_trap 'sdk cgo edit'
 
 (cd $BUILD_HOME/sdk/js &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/sdk)
@@ -844,6 +1731,7 @@ error_trap 'sdk js edit'
 # aar, apple xcframework, cgo desktop) picks the version up from this one edit.
 (cd $BUILD_HOME/sdk &&
     go_mod_edit_module github.com/urnetwork/sdk &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/goidenticons &&
@@ -852,39 +1740,68 @@ error_trap 'sdk js edit'
     go_edit_require_subpackages github.com/urnetwork/glog &&
     go_edit_require_subpackages github.com/urnetwork/goidenticons &&
     $BUILD_SED -i "s/Version string = \"\"/Version string = \"${WARP_VERSION}\"/g" sdk.go &&
-    go_mod_fork 'build' 'cgo' 'js')
+    go_mod_fork 'build' 'cgo' 'js' 'packaging' 'python' 'ruby' 'rust' 'csharp' 'java' 'kotlin' 'swift')
 error_trap 'sdk edit'
 
 (cd $BUILD_HOME/sdk &&
     git_commit &&
+    sdk_tagged_module_tree=`git rev-parse HEAD:v${GO_MOD_VERSION}` &&
     git_tag &&
     go_mod_fork_update 'build' &&
     go_mod_fork_update 'cgo' &&
     go_mod_fork_update 'js' &&
     npm_fork_update 'js' &&
+    # These are nested build/npm modules and are excluded from the tagged root
+    # Go module. Preserve their generated locks on the release branch without
+    # moving the already-published root module tag.
     git_commit &&
-    # re-tag the same version now that the fork/lock files above were regenerated;
-    # "recreate" intentionally moves the existing tag instead of failing on the duplicate
-    git_tag recreate)
+    test "$sdk_tagged_module_tree" = `git rev-parse HEAD:v${GO_MOD_VERSION}`)
 error_trap 'sdk push branch'
 
-(cd $BUILD_HOME/sdk/js &&
-    npm_publish)
+# Package-manager release configuration lives beside the JS SDK publication.
+# Native publishers run after the required platform jobs, using this run's
+# artifact manifest. Swift/Carthage and Rust wait for public GitHub asset URLs.
+export SDK_PACKAGE_VERSION="$EXTERNAL_WARP_VERSION"
+export SDK_PACKAGE_CHANNEL="${SDK_PACKAGE_CHANNEL:-nightly}"
+sdk_package_stage () {
+    go -C "$BUILD_HOME/sdk/packaging" run . release "$1"
+}
+sdk_package_stage plan
+error_trap 'sdk package publishing plan'
+SDK_NPM_PUBLISH="$(go -C "$BUILD_HOME/sdk/packaging" run . credential npm)"
+error_trap 'npm SDK publishing credential check'
+
+(cd "$BUILD_HOME/sdk/js" &&
+    make package check-package publish)
 error_trap 'js-sdk publish'
 
 
 (cd $BUILD_HOME/sn &&
     go_mod_edit_module github.com/urfoundation/sn &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/sdk &&
     go_mod_edit_require github.com/urnetwork/goidenticons &&
+    # Drop the local-development server requirement. Integration tools that
+    # need unpublished server packages stay outside the versioned module below;
+    # remaining library tests can resolve an already-published server version.
+    go_mod_drop_require github.com/urnetwork/server &&
+    go_mod_edit_require github.com/urnetwork/proxy &&
+    go_mod_edit_require github.com/urnetwork/userwireguard &&
     go_edit_require_subpackages github.com/urfoundation/sn &&
     go_edit_require_subpackages github.com/urnetwork/connect &&
     go_edit_require_subpackages github.com/urnetwork/glog &&
     go_edit_require_subpackages github.com/urnetwork/sdk &&
     go_edit_require_subpackages github.com/urnetwork/goidenticons &&
-    go_mod_fork)
+    go_edit_require_subpackages github.com/urnetwork/server &&
+    go_edit_require_subpackages github.com/urnetwork/proxy &&
+    go_edit_require_subpackages github.com/urnetwork/userwireguard &&
+    # These integration tools exercise server source changes before its tag
+    # exists. Preserve their source and tests beside the versioned SN module in
+    # the Git release so tidy does not require unpublished server APIs. Server
+    # can then depend on the immutable SN tag.
+    go_mod_fork 'sim-testnet' 'scripts/server-fixture')
 error_trap 'sn edit'
 
 (cd $BUILD_HOME/sn &&
@@ -895,6 +1812,7 @@ error_trap 'sn push branch'
 
 (cd $BUILD_HOME/server &&
     go_mod_edit_module github.com/urnetwork/server &&
+    go_mod_edit_gvisor &&
     go_mod_edit_require github.com/urnetwork/connect &&
     go_mod_edit_require github.com/urnetwork/glog &&
     go_mod_edit_require github.com/urnetwork/goidenticons &&
@@ -910,7 +1828,13 @@ error_trap 'sn push branch'
     go_edit_require_subpackages github.com/urnetwork/userwireguard &&
     go_edit_require_subpackages github.com/urnetwork/sdk &&
     go_edit_require_subpackages github.com/urfoundation/sn &&
-    go_mod_fork)
+    # The committed sim-latency baseline is an immutable 500+ MiB evidence
+    # dataset, not a server package or runtime asset. Keep it beside the
+    # versioned module on the release branch so it remains in the Git tag for
+    # audit/reproduction without entering the Go module's source archive.
+    # Otherwise server/v20xx exceeds Go's 500 MiB module-zip limit and cannot be
+    # resolved by sn (or any other module consumer).
+    go_mod_fork 'connect/sim-latency/baseline')
 error_trap 'server edit'
 
 (cd $BUILD_HOME/server &&
@@ -949,12 +1873,6 @@ error_trap 'linux push branch'
 error_trap 'web push branch'
 
 
-(cd $BUILD_HOME/docs && 
-    git_commit &&
-    git_tag)
-error_trap 'docs push branch'
-
-
 (cd $BUILD_HOME/warp && 
     git_commit &&
     git_tag)
@@ -968,18 +1886,33 @@ error_trap 'warp push branch'
 error_trap 'localizations edit'
 
 (cd $BUILD_HOME/localizations &&
-    npm_publish)
+    npm_publish @urnetwork/localizations "$EXTERNAL_WARP_VERSION")
 error_trap 'localizations push branch'
 
 
-# give npm a bit of time to ingest the latest packages before we link against them
-sleep 30
-
-
 (cd $BUILD_HOME/extension &&
-    npm_edit_module @urnetwork/localizations &&
-    npm_edit_module @urnetwork/sdk-js &&
-    npm_fork_version "$EXTENSION_VERSION")
+    # The extension does not depend on the @urnetwork/sdk npm package: it
+    # builds against the sibling $BUILD_HOME/sdk/js checkout of this run (its
+    # TS source, and the wasm `make package` built above; see the extension's
+    # sdk-source.ts), so only localizations is pinned here.
+    # No registry version was created when npm credentials were absent. Keep
+    # the extension's existing registry pins in that case, so it can still build.
+    if [ "$SDK_NPM_PUBLISH" = yes ]; then
+        # npm acknowledges a publish before registry metadata and its tarball
+        # are necessarily available. Prove the exact dependency with fresh
+        # caches before npm install resolves the extension lock; the readiness
+        # helper retries only the expected bounded ETARGET/E404 propagation
+        # window. npm_fork_version then uses separate fresh caches and retries
+        # only an ETARGET naming this exact dependency.
+        "$BUILD_HOME/all/npm-package-ready.zsh" \
+            @urnetwork/localizations "$EXTERNAL_WARP_VERSION" &&
+        npm_edit_module @urnetwork/localizations &&
+        npm_fork_version "$EXTENSION_VERSION" \
+            @urnetwork/localizations "$EXTERNAL_WARP_VERSION"
+    else
+        builder_message "npm publication skipped; extension retains its current registry dependencies" &&
+        npm_fork_version "$EXTENSION_VERSION"
+    fi)
 error_trap 'extension edit'
 
 (cd $BUILD_HOME/extension && 
@@ -991,7 +1924,7 @@ error_trap 'extension push branch'
 (cd $BUILD_HOME &&
     git add . &&
     git commit -m "${EXTERNAL_WARP_VERSION}" &&
-    (git push || (git pull --rebase && git push)) &&
+    git_push_with_rebase_retry &&
     git_tag)
 error_trap 'push branch'
 # version code variants for the github flavor
@@ -1030,16 +1963,15 @@ github_create_draft_release () {
 }
 
 github_release_upload () {
+    require_build_artifacts "$2"
+    error_trap "required github release artifact $1"
     virustotal "$1" "$2"
 
-    GITHUB_UPLOAD=`$BUILD_CURL \
-        -X POST \
-        -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' \
-        -H 'Content-Type: application/octet-stream' \
-        -H "Authorization: Bearer $GITHUB_API_KEY" \
-        "$GITHUB_UPLOAD_URL?name=$1" \
-        --data-binary "@$2"`
+    # This transport preserves GitHub's response headers/message and retries
+    # only explicit rate-limit rejections. Ambiguous transport failures,
+    # duplicate assets, and permanent authorization failures remain fail-closed.
+    GITHUB_UPLOAD=$("$BUILD_HOME/all/github-release-upload.zsh" \
+        "$GITHUB_UPLOAD_URL" "$1" "$2")
     error_trap "github release upload $1"
 }
 
@@ -1149,6 +2081,78 @@ ${HEADER}
 $a"
     done
 
+    # THE FULL CHANGELOG, and this is the only place it goes.
+    #
+    # Every commit in every submodule since the previous release, grouped by
+    # component, with bodies and links -- the thing that cannot fit in the
+    # 500-character store note. The GitHub release body is where it belongs: it
+    # is the artifact Obtainium users and anyone following releases already read,
+    # and it is public, unlike mmm/ur.io.
+    #
+    # BASE RELEASE ONLY ($1 is set for the +2/+3 architecture-specific releases).
+    # Those are the same release re-tagged per ABI -- their body already says so
+    # -- and repeating tens of kilobytes three times is noise that would also
+    # triple the exposure to the size limit below.
+    #
+    # THAT LIMIT IS A RELEASE-LOSING ONE, which is why it is checked rather than
+    # assumed. The API answers 422 "body is too long (maximum is 125000
+    # characters)", $BUILD_CURL carries --fail-with-body so any HTTP >= 400 exits
+    # non-zero, and the error_trap below then exits the run -- AFTER every artifact
+    # has already been uploaded. changelog.py budgets itself to 120000 by default;
+    # this re-checks against what the header and the VirusTotal table actually
+    # took, and drops the section with a warning rather than risking the release.
+    #
+    # BUILD_URIO_CHANGELOG=0 disables the release-body/store notes (the ur.io
+    # website consumes separately maintained metadata). With
+    # generation enabled, BUILD_RELEASE_BODY_CHANGELOG= remains the narrower
+    # switch that omits only this release-body section (see README).
+    if [ ! "$1" ] && [ "${BUILD_URIO_CHANGELOG:-1}" = 1 ] && [ "${BUILD_RELEASE_BODY_CHANGELOG:-1}" ] && [ -s "$BUILD_CHANGELOG_FULL" ]; then
+        RELEASE_CHANGELOG=`cat "$BUILD_CHANGELOG_FULL"`
+        # THE LINK FIRST, and it resolves because of ordering, not luck: the
+        # `git add . && git commit && git_tag` on $BUILD_HOME above ran before
+        # github_create_draft_release(), so v${EXTERNAL_WARP_VERSION} already
+        # exists and already contains changelogs/. Pinned to the tag rather than
+        # to a branch so the link keeps showing THIS release's changelog forever.
+        RELEASE_BODY="$RELEASE_BODY
+
+---
+
+Full changelog: [changelogs/${BUILD_NOTES_PREFIX}_Full.md](https://github.com/urnetwork/build/blob/v${EXTERNAL_WARP_VERSION}/changelogs/${BUILD_NOTES_PREFIX}_Full.md) -- every commit in every component since the previous release. Per-store notes for Play, App Store Connect, Partner Center and AppStream are in [that same directory](https://github.com/urnetwork/build/tree/v${EXTERNAL_WARP_VERSION}/changelogs)."
+        # THE SHORT VIEW INLINE, so the body still says something on its own.
+        RELEASE_NOTE_SIMPLE="$BUILD_NOTES_DIR/${BUILD_NOTES_PREFIX}_Simple.txt"
+        if [ -s "$RELEASE_NOTE_SIMPLE" ]; then
+            RELEASE_BODY="$RELEASE_BODY
+
+$(cat "$RELEASE_NOTE_SIMPLE")"
+        fi
+        # THE FULL TEXT STAYS, FOLDED. ur.io's site changelog is generated by
+        # walking these release bodies during separate website maintenance,
+        # from a repo this one cannot see, so
+        # replacing the text with a link would quietly starve a public website of
+        # its content. <details> collapses it in the GitHub UI -- uncluttered to
+        # read, still present to scrape. Drop the fold once someone has confirmed
+        # what that generator actually reads; BUILD_RELEASE_BODY_CHANGELOG= turns
+        # this whole section off in the meantime.
+        #
+        # THE SIZE CHECK IS STILL A RELEASE-LOSING ONE. The API answers 422 above
+        # 125000 characters and $BUILD_CURL --fail-with-body would exit the run
+        # AFTER every artifact has been uploaded. Now that the link carries the
+        # changelog on its own, an over-budget body drops only the fold, and the
+        # reader still gets there in one click -- which is what makes dropping it
+        # safe rather than lossy.
+        if [ $((${#RELEASE_BODY} + ${#RELEASE_CHANGELOG} + 128)) -le 124000 ]; then
+            RELEASE_BODY="$RELEASE_BODY
+
+<details><summary>Full changelog</summary>
+
+$RELEASE_CHANGELOG
+
+</details>"
+        else
+            builder_message "note: the full changelog (${#RELEASE_CHANGELOG} chars) does not fit the release body next to the artifact table, so the body links to it instead of embedding it. Build will continue."
+        fi
+    fi
+
     GITHUB_RELEASE=`$BUILD_CURL \
         -X PATCH \
         -H 'Accept: application/vnd.github+json' \
@@ -1182,7 +2186,7 @@ sn_cli_release () {
         os="${osarch%/*}"
         arch="${osarch#*/}"
         gomips=""
-        case "$arch" in mips*) gomips="GOMIPS=softfloat" ;; esac
+        gomips="$(go_mips_softfloat_env "$arch")"
         # `go build -o <file>` writes the name verbatim -- it only appends the
         # platform exe suffix when it derives the name itself (`-o <dir>/`). The
         # binary is renamed here (cli/miner -> provider), so the suffix has to be
@@ -1204,6 +2208,9 @@ github_create_draft_release
 
 (cd $BUILD_HOME/sdk/build && make)
 error_trap 'build sdk'
+
+sdk_package_stage mobile
+error_trap 'sdk Swift package build and check'
 
 github_release_upload "URnetworkSdk-${EXTERNAL_WARP_VERSION}.aar" "$BUILD_HOME/sdk/build/android/URnetworkSdk.aar"
 github_release_upload "URnetworkSdk-sources-${EXTERNAL_WARP_VERSION}.jar" "$BUILD_HOME/sdk/build/android/URnetworkSdk-sources.jar"
@@ -1255,6 +2262,12 @@ error_trap 'build bringyourctl'
 
 (cd $BUILD_HOME/proxy${GO_MOD_SUFFIX}/socks && make)
 error_trap 'build proxy socks'
+# The socks Makefile picks the MIPS float variables itself. A hardfloat MIPS
+# binary crashes on FPU-less routers, so check what the toolchain recorded.
+for proxy_socks_arch in mips mipsle mips64 mips64le; do
+    go_mips_require_softfloat "$proxy_socks_arch" "$BUILD_HOME/proxy${GO_MOD_SUFFIX}/socks/build/linux/$proxy_socks_arch/socks"
+    error_trap "proxy socks $proxy_socks_arch softfloat"
+done
 
 github_release_upload "urnetwork-proxy-socks-${EXTERNAL_WARP_VERSION}.tar.gz" "$BUILD_HOME/proxy${GO_MOD_SUFFIX}/socks/build/proxy-socks.tar.gz"
 
@@ -1275,7 +2288,10 @@ builder_message "proxy socks \`${EXTERNAL_WARP_VERSION}\` available - https://gi
 # builder_message "proxy wg \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
 
 
-(cd $BUILD_HOME/extension && make)
+# UR_SKIP_SDK_BUILD: the extension's sync-sdk step uses the sdk wasm `make
+# package` built in $BUILD_HOME/sdk/js above instead of rebuilding it, and
+# fails if there is none
+(cd $BUILD_HOME/extension && UR_SKIP_SDK_BUILD=1 make)
 error_trap 'build extension'
 
 github_release_upload "crx-@urnetwork-extension-${EXTENSION_VERSION}.zip" "$BUILD_HOME/extension/release/crx-@urnetwork-extension-${EXTENSION_VERSION}.zip"
@@ -1288,19 +2304,59 @@ builder_message "extension \`${EXTENSION_VERSION}\` available - https://github.c
 #    ITMS-90048: This bundle is invalid - Your archive contains paths that are not allowed: [._Symbols]
 # see https://github.com/flutter/flutter/issues/166367
 bug_fix_clean_ipa () {
-    unzip -l "$1" | grep ._Symbols && zip -d "$1" ._Symbols/ || echo "No ._Symbols found. Nothing to clean up."
+    local entries
+    entries=$(unzip -Z1 "$1") || return $?
+    if printf '%s\n' "$entries" | grep -Eq '^\._Symbols(/|$)'; then
+        zip -d "$1" '._Symbols' '._Symbols/*' || return $?
+    else
+        echo "No ._Symbols found. Nothing to clean up."
+    fi
+}
+
+# macos_notarize_and_staple <path> — submit an .app (zipped for the upload) or
+# a .dmg to Apple's notary service with the App Store Connect API key, wait for
+# the verdict, require "Accepted" (a non-accepted verdict is a failure even
+# when notarytool exits 0), then staple the ticket to the path.
+macos_notarize_and_staple () {
+    local target="$1" submission="$1" verdict verdict_status
+    if [ ! -f "$APPLE_API_KEY_P8" ]; then
+        builder_message "error: notarytool needs the App Store Connect API key AuthKey_${APPLE_API_KEY}.p8 in ~/.private_keys, ~/private_keys or ~/.appstoreconnect/private_keys"
+        return 1
+    fi
+    if [ -d "$target" ]; then
+        submission="${target%.app}-notarize.zip"
+        rm -f "$submission"
+        ditto -c -k --keepParent "$target" "$submission" || return $?
+    fi
+    verdict=$(xcrun notarytool submit "$submission" --key "$APPLE_API_KEY_P8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait 2>&1)
+    verdict_status=$?
+    echo "$verdict"
+    if [ $verdict_status != 0 ]; then
+        return $verdict_status
+    fi
+    if ! echo "$verdict" | grep -q 'status: Accepted'; then
+        builder_message "error: notarization of $target was not accepted"
+        return 1
+    fi
+    if [ "$submission" != "$target" ]; then
+        rm -f "$submission"
+    fi
+    xcrun stapler staple "$target"
 }
 
 # Headless provisioning auth (REMOTEBUILD.md): hand -allowProvisioningUpdates the
 # App Store Connect API key explicitly (Xcode 13+) so profile downloads never
 # depend on Xcode-account GUI state. altool below discovers the same .p8 by key
 # id from these standard directories; when none is found the array stays empty
-# and xcodebuild behaves exactly as before.
+# and xcodebuild behaves exactly as before. APPLE_API_KEY_P8 keeps the path for
+# notarytool (macOS direct download below), which takes the key file explicitly.
 XCODEBUILD_AUTH=()
+APPLE_API_KEY_P8=""
 for d in "$HOME/.private_keys" "$HOME/private_keys" "$HOME/.appstoreconnect/private_keys"; do
     if [ -f "$d/AuthKey_${APPLE_API_KEY}.p8" ]; then
+        APPLE_API_KEY_P8="$d/AuthKey_${APPLE_API_KEY}.p8"
         XCODEBUILD_AUTH=(
-            -authenticationKeyPath "$d/AuthKey_${APPLE_API_KEY}.p8"
+            -authenticationKeyPath "$APPLE_API_KEY_P8"
             -authenticationKeyID "$APPLE_API_KEY"
             -authenticationKeyIssuerID "$APPLE_API_ISSUER"
         )
@@ -1310,6 +2366,7 @@ done
 
 
 (cd $BUILD_HOME/apple/app &&
+    rm -f build/URnetwork.ipa &&
     xcodebuild -scheme URnetwork clean &&
     xcodebuild archive -allowProvisioningUpdates $XCODEBUILD_AUTH -workspace app.xcodeproj/project.xcworkspace -config Release -scheme URnetwork -archivePath build.xcarchive -destination generic/platform=iOS &&
     $BUILD_HOME/sdk/build/check_apple_size.sh \
@@ -1317,45 +2374,99 @@ done
         --extension-sdk $BUILD_HOME/sdk/build/apple/URnetworkExtensionSdk.xcframework \
         --extension build.xcarchive/Products/Applications/URnetwork.app/PlugIns/URnetworkVPN.appex &&
     xcodebuild archive -allowProvisioningUpdates $XCODEBUILD_AUTH -exportArchive -exportOptionsPlist ExportOptions.plist -archivePath build.xcarchive -exportPath build -destination generic/platform=iOS &&
+    require_build_artifacts build/URnetwork.ipa &&
     bug_fix_clean_ipa build/URnetwork.ipa &&
     xcrun altool --show-progress --validate-app --file build/URnetwork.ipa -t ios --apiKey $APPLE_API_KEY --apiIssuer $APPLE_API_ISSUER &&
     xcrun altool --show-progress --upload-app --file build/URnetwork.ipa -t ios --apiKey $APPLE_API_KEY --apiIssuer $APPLE_API_ISSUER)
-# failure to deploy to apple connect means we can't create an iOS release, but other platforms can still release
-# typically this is because we've already submitting a release for this build version
-warn_trap 'ios deploy'
+error_trap 'ios build and deploy'
 
-# the deploy above is allowed to soft-fail, so the .ipa may not exist (e.g. the
-# export could not sign); skip the dependent uploads instead of hard-failing them
-if [ -f "$BUILD_HOME/apple/app/build/URnetwork.ipa" ]; then
-    github_release_upload "URnetwork-${EXTERNAL_WARP_VERSION}.ipa" "$BUILD_HOME/apple/app/build/URnetwork.ipa"
-
-    builder_message "ios \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
-else
-    builder_message "warning: no ios .ipa artifact (deploy soft-failed above); skipping its release upload. Build will continue."
-fi
+github_release_upload "URnetwork-${EXTERNAL_WARP_VERSION}.ipa" "$BUILD_HOME/apple/app/build/URnetwork.ipa"
+builder_message "ios \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
 
 
 (cd $BUILD_HOME/apple/app &&
+    rm -f build/URnetwork.pkg &&
     xcodebuild -scheme URnetwork clean &&
     xcodebuild archive -allowProvisioningUpdates $XCODEBUILD_AUTH -workspace app.xcodeproj/project.xcworkspace -config Release -scheme URnetwork -archivePath build.xcarchive -destination generic/platform=macOS &&
     xcodebuild archive -allowProvisioningUpdates $XCODEBUILD_AUTH -exportArchive -exportOptionsPlist ExportOptions.plist -archivePath build.xcarchive -exportPath build -destination generic/platform=macOS &&
+    require_build_artifacts build/URnetwork.pkg &&
     xcrun altool --show-progress --validate-app --file build/URnetwork.pkg -t macos --apiKey $APPLE_API_KEY --apiIssuer $APPLE_API_ISSUER &&
     xcrun altool --show-progress --upload-app --file build/URnetwork.pkg -t macos --apiKey $APPLE_API_KEY --apiIssuer $APPLE_API_ISSUER)
-# failure to deploy to apple connect means we can't create an macOS release, but other platforms can still release
-# typically this is because we've already submitting a release for this build version
-warn_trap 'macos deploy'
+error_trap 'macos build and deploy'
 
-if [ -f "$BUILD_HOME/apple/app/build/URnetwork.pkg" ]; then
-    github_release_upload "URnetwork-${EXTERNAL_WARP_VERSION}.pkg" "$BUILD_HOME/apple/app/build/URnetwork.pkg"
-
-    builder_message "macos \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
-else
-    builder_message "warning: no macos .pkg artifact (deploy soft-failed above); skipping its release upload. Build will continue."
-fi
+# The macOS pkg is the Mac App Store export (app-store-connect ExportOptions.plist).
+# It is signed for the store only and does not launch when installed directly,
+# so it is NOT attached to the GitHub release; the direct download is the
+# Developer ID signed + notarized DMG built next (all/macos-release-asset.test.sh).
+builder_message "macos \`${EXTERNAL_WARP_VERSION}\` uploaded to App Store Connect"
 
 
 # =============================================================================
-# Desktop apps: Windows Store (MSI) + Linux (deb + install tarball + rpm + AppImage).
+# macOS direct download: the URnetworkDirect scheme (system-extension tunnel,
+# Stripe billing; apple/app/ExportOptions-DeveloperID.plist) exported with
+# Developer ID, notarized and stapled, wrapped in a DMG that is itself signed,
+# notarized and stapled, then Gatekeeper-assessed before it becomes the macOS
+# asset of the GitHub release and the ur.io install page. The App Store build
+# above is untouched. Signing is MANUAL (ExportOptions-DeveloperID.plist maps
+# each bundle id to its Developer ID profile), so the archive/export run
+# without -allowProvisioningUpdates and need the "Developer ID Application"
+# identity plus the three Developer ID profiles proved at startup
+# (macos_developer_id_identity, macos_require_direct_profiles; see the
+# provisioning profile note there), and the App Store Connect API key .p8
+# (APPLE_API_KEY_P8) for notarytool. Two assets: the stapled app zipped as
+# URnetwork-<version>-macos.zip for the app's own updater (apple
+# network/Shared/Updater, which fetches it by this exact name and verifies
+# GitHub's per-asset sha256 digest), then the DMG for humans. Covered by
+# all/macos-direct-release.test.sh and component_required_test.go.
+
+MACOS_DIRECT_DMG="URnetwork-${EXTERNAL_WARP_VERSION}-macos.dmg"
+MACOS_DIRECT_ZIP="URnetwork-${EXTERNAL_WARP_VERSION}-macos.zip"
+MACOS_DIRECT_IDENTITY=$(macos_developer_id_identity)
+error_trap 'macos direct: Developer ID Application identity'
+macos_require_direct_profiles "$MACOS_DIRECT_IDENTITY"
+error_trap 'macos direct: Developer ID provisioning profiles'
+
+(cd $BUILD_HOME/apple/app &&
+    rm -rf build-direct.xcarchive build/direct build/direct-dmg "build/$MACOS_DIRECT_DMG" "build/$MACOS_DIRECT_ZIP" &&
+    xcodebuild -scheme URnetworkDirect clean &&
+    xcodebuild archive -workspace app.xcodeproj/project.xcworkspace -config Release -scheme URnetworkDirect -archivePath build-direct.xcarchive -destination generic/platform=macOS &&
+    xcodebuild archive -exportArchive -exportOptionsPlist ExportOptions-DeveloperID.plist -archivePath build-direct.xcarchive -exportPath build/direct -destination generic/platform=macOS &&
+    require_build_artifacts build/direct/URnetwork.app/Contents/MacOS/URnetwork &&
+    macos_notarize_and_staple build/direct/URnetwork.app)
+error_trap 'macos direct build and notarize'
+
+# Updater zip: the stapled, Gatekeeper-assessed app archived with
+# --keepParent so it unpacks to URnetwork.app (ditto keeps the staple ticket
+# and extended attributes). Assessed here, before anything is published, so a
+# rejected app never reaches the release in either form.
+(cd $BUILD_HOME/apple/app &&
+    spctl --assess --type execute -vv build/direct/URnetwork.app &&
+    ditto -c -k --keepParent build/direct/URnetwork.app "build/$MACOS_DIRECT_ZIP" &&
+    require_build_artifacts "build/$MACOS_DIRECT_ZIP")
+error_trap 'macos direct zip'
+
+github_release_upload "URnetwork-${EXTERNAL_WARP_VERSION}-macos.zip" "$BUILD_HOME/apple/app/build/$MACOS_DIRECT_ZIP"
+
+# DMG: the stapled app plus an Applications symlink (drag to install; the app
+# must run from /Applications to activate its system extension)
+(cd $BUILD_HOME/apple/app &&
+    mkdir -p build/direct-dmg &&
+    ditto build/direct/URnetwork.app build/direct-dmg/URnetwork.app &&
+    ln -s /Applications build/direct-dmg/Applications &&
+    hdiutil create -volname URnetwork -srcfolder build/direct-dmg -ov -format UDZO "build/$MACOS_DIRECT_DMG" &&
+    require_build_artifacts "build/$MACOS_DIRECT_DMG" &&
+    codesign --force --timestamp --sign "$MACOS_DIRECT_IDENTITY" "build/$MACOS_DIRECT_DMG" &&
+    macos_notarize_and_staple "build/$MACOS_DIRECT_DMG" &&
+    spctl --assess --type open --context context:primary-signature -vv "build/$MACOS_DIRECT_DMG")
+error_trap 'macos direct dmg'
+
+github_release_upload "URnetwork-${EXTERNAL_WARP_VERSION}-macos.dmg" "$BUILD_HOME/apple/app/build/$MACOS_DIRECT_DMG"
+builder_message "macos direct download \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
+
+
+# =============================================================================
+# Desktop apps: Windows Store (MSI) + Linux (deb + install tarball + rpm + Arch
+# package + AppImage + Flatpak).
 # See build/DESKTOP_BUILD.md + build/all/{windows,linux}/README.md.
 #
 # Each platform builds via its own script (all/build-windows.sh,
@@ -1371,69 +2482,103 @@ fi
 # Each runs meson + the linux repo's packaging scripts, then verify.sh proves
 # the artifacts work: the AppImage extracts, bundles its GTK stack without
 # falling through to host libraries, and launches under xvfb; the .deb installs,
-# creates its group and purges cleanly; the install.sh tarball round-trips. The
-# artifact names are normative in linux/MIGRATION.md). The scripts use the local branches as-is
+# creates its group and purges cleanly; the install.sh tarball round-trips; the
+# .rpm and the Arch package carry the leg's arch tag. The artifact names are
+# normative in linux/MIGRATION.md). The scripts use the local branches as-is
 # (the version branches configured above) and inherit BUILD_HOME + the WARP_*
 # versions exported above; they can also be re-run standalone after this
 # pipeline, e.g. when a flaky VM/container build needs a retry.
 #
-# Non-blocking: a flaky desktop build must NOT sink the release. On failure,
-# warn and skip that platform's artifacts (don't upload stale/partial ones);
-# the pipeline continues.
+# Required: both desktop builds are release gates. On failure, stop before
+# uploading that platform's stale or partial artifacts.
 #
 # SUBMISSION/PUBLISHING is manual for now: this pipeline builds the bundles and
 # attaches them to the GitHub release; a human submits the MSI to the Microsoft
-# Store (Partner Center). Linux has no store — the deb/tarball/rpm/AppImage
-# ship from the release page, and re-hosting the AppImage + .zsync on the
-# update endpoint (GitHub Releases can't serve the multi-range requests zsync
-# needs — linux/APPIMAGE.md §11f) is likewise a manual follow-up. Publishing
-# the .deb to an apt repo and the .rpm to a dnf repo (which additionally wants
-# an rpm HEADER signature, not the detached .asc) are manual follow-ups too.
+# Store (Partner Center). Linux has no store — the deb/tarball/rpm/Arch
+# package/AppImage/Flatpak ship from the release page. The Linux GUI updates
+# itself from the STABLE urnetwork/linux releases
+# (linux/app/src/UpdateChecker.cpp), to which a human copies this nightly's
+# Linux assets under the same names when it is declared stable; there is no
+# zsync channel (GitHub Releases can't serve the multi-range requests zsync
+# needs — linux/APPIMAGE.md §11f), so no .zsync is built or uploaded.
+# Publishing the .deb to an apt repo and the .rpm to a dnf repo (which
+# additionally wants an rpm HEADER signature, not the detached .asc) are manual
+# follow-ups.
 # =============================================================================
 
 DESKTOP_OUT="${BUILD_OUT:-$BUILD_HOME/out}/desktop"
 
 builder_message "building windows app (cgo sdk + MSI in the local QEMU ARM Windows VM)"
-if OUT_DIR="$DESKTOP_OUT/windows" "$BUILD_HOME/all/build-windows.sh"; then
-    github_release_upload "URnetworkSdkWindows-${EXTERNAL_WARP_VERSION}.zip" "$BUILD_HOME/sdk/cgo/build/URnetworkSdkWindows.zip"
-    for msi in "$DESKTOP_OUT/windows/"*.msi(N); do
-        github_release_upload "$(basename "$msi")" "$msi"
-    done
-    builder_message "windows \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
-else
-    builder_message "warning: windows build did not finish — skipping the windows sdk + MSI artifacts (release continues)"
-fi
+OUT_DIR="$DESKTOP_OUT/windows" "$BUILD_HOME/all/build-windows.sh"
+error_trap 'windows build'
+require_windows_artifacts "$DESKTOP_OUT/windows" "$EXTERNAL_WARP_VERSION"
+error_trap 'required windows artifacts'
+github_release_upload "URnetworkSdkWindows-${EXTERNAL_WARP_VERSION}.zip" "$BUILD_HOME/sdk/cgo/build/URnetworkSdkWindows.zip"
+for msi in "$DESKTOP_OUT/windows/"*.msi(N); do
+    github_release_upload "$(basename "$msi")" "$msi"
+done
+builder_message "windows \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
 
-builder_message "building linux app (cgo sdk + deb/install-tarball/rpm on ubuntu 22.04 + AppImage on ubuntu 24.04, each verified in-container)"
-if OUT_DIR="$DESKTOP_OUT/linux" "$BUILD_HOME/all/build-linux.sh"; then
-    github_release_upload "URnetworkSdkLinux-${EXTERNAL_WARP_VERSION}.zip" "$BUILD_HOME/sdk/cgo/build/URnetworkSdkLinux.zip"
-    # Four artifact types per arch (names normative — linux/MIGRATION.md):
-    # urnetwork-daemon_<v>_<arch>.deb, urnetwork-daemon-<v>-<arch>.install.tar.gz,
-    # urnetwork-daemon-<v>.<rpmarch>.rpm, URnetwork-<v>-<arch>.AppImage +
-    # .AppImage.zsync. (N) nullglobs each pattern so a missing type uploads
-    # nothing rather than a literal '*' — which is also what makes the .rpm's
-    # warn-and-continue behaviour in build-linux.sh work at this level: a
-    # release without one simply uploads the other four.
-    #
-    # A bare *.rpm is safe: nfpm writes binary rpms only, so no .src.rpm can
-    # appear here. The .sha256/.asc sidecars the packaging scripts write are
-    # deliberately NOT uploaded, matching the .deb's existing behaviour.
-    for artifact in "$DESKTOP_OUT/linux/"*.deb(N) \
-                    "$DESKTOP_OUT/linux/"*.install.tar.gz(N) \
-                    "$DESKTOP_OUT/linux/"*.rpm(N) \
-                    "$DESKTOP_OUT/linux/"*.pkg.tar.zst(N) \
-                    "$DESKTOP_OUT/linux/"*.AppImage(N) \
-                    "$DESKTOP_OUT/linux/"*.AppImage.zsync(N); do
-        github_release_upload "$(basename "$artifact")" "$artifact"
-    done
-    builder_message "linux \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
-else
-    builder_message "warning: linux build did not finish — skipping the linux sdk + deb/install-tarball/rpm/AppImage artifacts (release continues)"
-fi
+builder_message "building linux app (cgo sdk + deb/install-tarball/rpm/arch on ubuntu 22.04 + AppImage on ubuntu 24.04, each verified in-container; then Flatpak in its dependency-complete Linux container)"
+UR_REQUIRE_RPM=true UR_REQUIRE_ARCH_PKG=true OUT_DIR="$DESKTOP_OUT/linux" "$BUILD_HOME/all/build-linux.sh"
+error_trap 'linux build'
+github_release_upload "URnetworkSdkLinux-${EXTERNAL_WARP_VERSION}.zip" "$BUILD_HOME/sdk/cgo/build/URnetworkSdkLinux.zip"
+
+sdk_package_stage desktop
+error_trap 'sdk native package build, check and publish'
+for sdk_package_asset in "$BUILD_HOME/sdk/packaging/release/assets/"*(N.); do
+    github_release_upload "$(basename "$sdk_package_asset")" "$sdk_package_asset"
+done
+
+# THE FLATPAK, built in its own Linux container. The release host is macOS, so
+# flatpak cannot be a host prerequisite. Dockerfile.flatpak installs flatpak,
+# native flatpak-builder, elfutils and their source helpers; the first run also
+# installs the GNOME runtime into a persistent Docker volume. The container is
+# separate from the daemon/AppImage images because bubblewrap needs nested
+# namespaces: only this one receives CAP_SYS_ADMIN/CAP_NET_ADMIN and the
+# matching Docker security-policy relaxations. Its source bind mount remains
+# read-only.
+#
+# It runs AFTER build-linux.sh because the manifest vendors the cgo SDK that
+# build-linux.sh stages into the tree.
+#
+# ONE ARCH. flatpak-builder has no cross-compile mode, so this produces a bundle
+# for this build machine's architecture (inside the matching Docker platform).
+# The other architecture still gets the AppImage and native packages.
+#
+# This is a release gate now that its toolchain is managed by the build. A real
+# Flatpak failure must stop before the uploader silently ships no bundle.
+VERSION="${EXTERNAL_WARP_VERSION}" \
+LINUX_DIR="$BUILD_HOME/linux" \
+OUT_DIR="$DESKTOP_OUT/linux" \
+    bash "$BUILD_HOME/all/linux/build-flatpak.sh"
+error_trap 'flatpak build'
+require_linux_artifacts "$DESKTOP_OUT/linux" "$EXTERNAL_WARP_VERSION"
+error_trap 'required linux artifacts'
+
+# Six artifact types per arch (names normative — linux/MIGRATION.md):
+# urnetwork-daemon_<v>_<arch>.deb, urnetwork-daemon-<v>-<arch>.install.tar.gz,
+# urnetwork-daemon-<v>.<rpmarch>.rpm, urnetwork-daemon-<v>-<pkgarch>.pkg.tar.zst,
+# URnetwork-<v>-<arch>.AppImage, and URnetwork-<v>-<arch>.flatpak (one native
+# architecture). Exact selected outputs are required above; (N) avoids literal
+# wildcard uploads without allowing missing types to succeed.
+#
+# A bare *.rpm is safe: nfpm writes binary rpms only, so no .src.rpm can
+# appear here. The .sha256/.asc sidecars the packaging scripts write are
+# deliberately NOT uploaded, matching the .deb's existing behaviour.
+for artifact in "$DESKTOP_OUT/linux/"*.deb(N) \
+                "$DESKTOP_OUT/linux/"*.install.tar.gz(N) \
+                "$DESKTOP_OUT/linux/"*.rpm(N) \
+                "$DESKTOP_OUT/linux/"*.pkg.tar.zst(N) \
+                "$DESKTOP_OUT/linux/"*.flatpak(N) \
+                "$DESKTOP_OUT/linux/"*.AppImage(N); do
+    github_release_upload "$(basename "$artifact")" "$artifact"
+done
+builder_message "linux \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
 
 
 (cd $BUILD_HOME/android/app &&
-    ./gradlew clean assemblePlayRelease bundlePlayRelease assembleSolana_dappRelease assembleEthos_dappRelease)
+    ./gradlew clean assemblePlayRelease bundlePlayRelease assembleSolana_dappRelease)
 error_trap 'android build'
 
 github_release_upload \
@@ -1448,10 +2593,6 @@ github_release_upload \
     "com.bringyour.network-${EXTERNAL_WARP_VERSION}-solana_dapp-release.apk" \
     "$BUILD_HOME/android/app/app/build/outputs/apk/solana_dapp/release/com.bringyour.network-${EXTERNAL_WARP_VERSION}-solana_dapp-universal-release.apk"
 
-github_release_upload \
-    "com.bringyour.network-${EXTERNAL_WARP_VERSION}-ethos_dapp-release.apk" \
-    "$BUILD_HOME/android/app/app/build/outputs/apk/ethos_dapp/release/com.bringyour.network-${EXTERNAL_WARP_VERSION}-ethos_dapp-universal-release.apk"
-
 if [ "$BUILD_OUT" ]; then
     (mkdir -p "$BUILD_OUT/apk" &&
         find $BUILD_HOME/android/app/app/build/outputs/apk -iname '*.apk' -exec cp {} "$BUILD_OUT/apk" \;)
@@ -1465,7 +2606,15 @@ builder_message "android \`${EXTERNAL_WARP_VERSION}\` available - https://github
 
 
 # Github / Ungoogle
-# note for F-Droid, the -ungoogle tag should be aliased to -fdroid to trigger their build
+# note for F-Droid, the -ungoogle tag is aliased to -fdroid to trigger their build,
+# but only after the APKs are published (see git_tag_fdroid below)
+#
+# REMEMBER WHERE THE RELEASE COMMIT IS, because everything below moves the
+# android submodule off it and onto a degoogled branch, and the build repo has
+# to be put back afterwards. See the restore at the end of this section for why
+# that matters.
+ANDROID_RELEASE_COMMIT=`cd $BUILD_HOME/android && git rev-parse HEAD`
+error_trap 'android release commit'
 (cd $BUILD_HOME/android &&
     git checkout -b v${EXTERNAL_WARP_VERSION}-ungoogle)
 error_trap 'android prepare ungoogle version branch'
@@ -1484,10 +2633,10 @@ error_trap 'android edit ungoogle settings'
     git push -u origin v${EXTERNAL_WARP_VERSION}-ungoogle)
 error_trap 'android ungoogle push branch'
 
-(cd $BUILD_HOME && 
-    git add . && 
-    git commit -m "$HOST build ungoogle" && 
-    git push)
+(cd $BUILD_HOME &&
+    git add . &&
+    git commit -m "$HOST build ungoogle" &&
+    git_push_with_rebase_retry)
 error_trap 'push ungoogle branch'
 (cd $BUILD_HOME && 
     git tag -a v${EXTERNAL_WARP_VERSION}-ungoogle -m "${EXTERNAL_WARP_VERSION}-ungoogle" && 
@@ -1523,6 +2672,45 @@ if [ "$BUILD_OUT" ]; then
     error_trap 'android github local copy'
 fi
 
+
+# PUT THE ANDROID PIN BACK. Everything the degoogled tree was needed for is
+# done: the -ungoogle branch and tag are pushed, build-fdroid.sh has run, and
+# the apks are uploaded and copied. What is left is a build repo whose main
+# records the degoogled android commit as its submodule pin, and that is not a
+# state anybody should inherit.
+#
+# The degoogled build.gradle comments out every play-services dependency, but
+# the play and solana_dapp sources still import GoogleSignIn, LocationServices
+# and friends. So main pinned there cannot compile those flavors for anyone
+# who builds from it, until the next release moves the pin again. The
+# `builder build ungoogle` commit is what leaves it there.
+#
+# The -ungoogle TAG still points at the degoogled tree, which is the point of
+# it: F-Droid builds from that tag. This restores only main, to the same commit
+# v${EXTERNAL_WARP_VERSION} already records.
+#
+# THE WORKING TREE IS RESTORED TOO, not just the index. The next run opens with
+# `git diff --quiet && git diff --cached --quiet` on $BUILD_HOME (see the pull
+# near the top), and a submodule whose checkout disagrees with the recorded pin
+# reads as a dirty diff -- which would short-circuit that && chain and abort the
+# run at 'pull'. Fixing the pin without the checkout would trade a broken main
+# for a broken build host.
+if [ "$ANDROID_RELEASE_COMMIT" ]; then
+    (cd $BUILD_HOME/android && git checkout "$ANDROID_RELEASE_COMMIT")
+    error_trap 'android restore release commit'
+    # --quiet is the no-op guard: when the pin already matches (nothing staged),
+    # `git commit` would exit non-zero and error_trap would sink a good release.
+    (cd $BUILD_HOME &&
+        git add android &&
+        (git diff --cached --quiet ||
+            (git commit -m "${EXTERNAL_WARP_VERSION} restore android pin" &&
+                git_push_with_rebase_retry)))
+    error_trap 'restore android pin'
+    builder_message "android pin restored to \`${ANDROID_RELEASE_COMMIT}\` (the \`${EXTERNAL_WARP_VERSION}\` release commit); the degoogled tree stays on the \`v${EXTERNAL_WARP_VERSION}-ungoogle\` tag"
+else
+    builder_message "warning: ANDROID_RELEASE_COMMIT is empty, so main is still pinned to the degoogled android tree, which cannot build the play and solana_dapp flavors until that is corrected."
+fi
+
 # Upload releases to testing channels
 
 builder_message "android github \`${EXTERNAL_WARP_VERSION}\` available - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
@@ -1530,6 +2718,9 @@ builder_message "android github \`${EXTERNAL_WARP_VERSION}\` available - https:/
 
 github_create_release
 
+
+sdk_package_stage public
+error_trap 'sdk packages referencing public release assets'
 
 # create pre-releases for version code variants
 # this is needed for reproducible builds
@@ -1540,7 +2731,7 @@ github_create_release
     github_release_upload \
         "com.bringyour.network-${EXTERNAL_WARP_VERSION}-github-armeabi-v7a-release.apk" \
         "$BUILD_HOME/android/app/app/build/outputs/apk/github/release/com.bringyour.network-${BASE_EXTERNAL_WARP_VERSION}-github-armeabi-v7a-release.apk" &&
-    github_create_release true
+    github_create_release true &&
     echo "[1/2]Monitor the F-Droid build here: https://monitor.f-droid.org/builds/log/com.bringyour.network/$WARP_VERSION_CODE"
 )
 error_trap 'android github armeabi-v7a reproducible pre-release'
@@ -1551,17 +2742,133 @@ error_trap 'android github armeabi-v7a reproducible pre-release'
     github_create_draft_release true &&
     github_release_upload \
         "com.bringyour.network-${EXTERNAL_WARP_VERSION}-github-arm64-v8a-release.apk" \
-        "$BUILD_HOME/android/app/app/build/outputs/apk/github/release/com.bringyour.network-${BASE_EXTERNAL_WARP_VERSION}-github-arm64-v8a-release.apk"
-    github_create_release true
+        "$BUILD_HOME/android/app/app/build/outputs/apk/github/release/com.bringyour.network-${BASE_EXTERNAL_WARP_VERSION}-github-arm64-v8a-release.apk" &&
+    github_create_release true &&
     echo "[2/2]Monitor the F-Droid build here: https://monitor.f-droid.org/builds/log/com.bringyour.network/$WARP_VERSION_CODE"
 )
 error_trap 'android github arm64-v8a reproducible pre-release'
 
+# Every APK F-Droid verifies against is now published (each upload and release
+# above exits the run on failure), so mark this version as ready for F-Droid.
+(cd $BUILD_HOME &&
+    git_tag_fdroid)
+error_trap 'push fdroid tag'
+builder_message "android fdroid tag \`v${EXTERNAL_WARP_VERSION}-fdroid\` pushed"
+
 
 # Warp services
-(cd $BUILD_HOME && warpctl build $BUILD_ENV warp/config-updater/Makefile)
-error_trap 'warpctl build config-updater'
-builder_message "service config-updater \`${EXTERNAL_WARP_VERSION}\` available"
+
+# Generate both databases from the selected versioned Server before packaging
+# config. Ordinary local builds may keep using their existing cache; this is
+# the explicit all-release refresh workflow, not a service startup gate.
+# arindbctl update refreshes GeoLite2 and ARIN, builds the registration
+# database, pins fresh evidence for the required reviewed subscriber catalog,
+# runs the subscriber augmentation, audits the catalog and validates the result
+# against RIPE Atlas. Only GeoLite2, ARIN and the RIS routing snapshots are
+# required; other evidence that is unavailable upstream is left out and named
+# in arindb/update-manifest.json and the release message.
+refresh_ip_databases () {
+    local geoip_config="${GEOIP_CONF_FILE:-$WARP_HOME/vault/mm-geoip.yml}"
+    local arin_credentials="${ARIN_CREDENTIALS_FILE:-$WARP_HOME/vault/arin.yml}"
+    local arin_rules="${ARIN_RULES_FILE:-$WARP_HOME/config/$BUILD_ENV/arindb.yml}"
+    local subscriber_catalog="${ARIN_SUBSCRIBER_CATALOG_FILE:-$WARP_HOME/config/$BUILD_ENV/arindb-subscribers/catalog.yml}"
+    if [ ! -f "$geoip_config" ] || [ ! -r "$geoip_config" ]; then
+        print -u2 -- "IP refresh requires readable GEOIP_CONF_FILE: $geoip_config"
+        return 1
+    fi
+    if [ ! -f "$arin_credentials" ] || [ ! -r "$arin_credentials" ]; then
+        print -u2 -- "IP refresh requires readable ARIN_CREDENTIALS_FILE: $arin_credentials"
+        return 1
+    fi
+    if [ ! -f "$arin_rules" ] || [ ! -r "$arin_rules" ]; then
+        print -u2 -- "IP refresh requires readable ARIN_RULES_FILE with reviewed classifier rules: $arin_rules"
+        return 1
+    fi
+    local -a update_args
+    update_args=()
+    if [ ! -f "$subscriber_catalog" ] || [ ! -r "$subscriber_catalog" ]; then
+        # Every full release retains the reviewed subscriber identities.
+        # A missing default or override must not drop their augmentation.
+        print -u2 -- "IP refresh requires readable ARIN_SUBSCRIBER_CATALOG_FILE: $subscriber_catalog"
+        return 1
+    fi
+    update_args+=(--subscriber-catalog "$subscriber_catalog")
+    if [ "${ARIN_RELAY_GEOFEEDS:-0}" = 1 ]; then
+        update_args+=(--relay-geofeeds)
+    fi
+    local config_root="$WARP_HOME/config"
+    local geoip_target="$config_root/all/mmdb/$WARP_VERSION"
+    local arin_target="$config_root/all/arindb/$WARP_VERSION"
+    if [ -e "$geoip_target" ] || [ -L "$geoip_target" ] || [ -e "$arin_target" ] || [ -L "$arin_target" ]; then
+        print -u2 -- "IP refresh version already exists; existing cache versions are never replaced"
+        return 1
+    fi
+    local ipdb_out="${BUILD_OUT:-$BUILD_HOME/out}/ip-databases"
+    mkdir -p -- "$ipdb_out" || return $?
+    ipdb_out=$(cd "$ipdb_out" && pwd -P) || return $?
+    local ipdb_work
+    ipdb_work=$(mktemp -d "$ipdb_out/refresh.XXXXXXXX") || return $?
+    (cd "$BUILD_HOME/server${GO_MOD_SUFFIX}" &&
+        go build -ldflags "-X main.Version=$WARP_VERSION" -o "$ipdb_work/arindbctl" ./arindbctl) || return $?
+    # Nothing is published unless every required database validates. The
+    # subscriber evidence, registration base, audit and validation stay in
+    # $ipdb_work/bundle/subscriber-evidence for review; they are not config.
+    "$ipdb_work/arindbctl" update \
+        --geoip-config "$geoip_config" \
+        --credentials "$arin_credentials" \
+        --rules "$arin_rules" \
+        "${update_args[@]}" \
+        --output "$ipdb_work/bundle" \
+        --timeout 2h || return $?
+    if [ -e "$geoip_target" ] || [ -L "$geoip_target" ] || [ -e "$arin_target" ] || [ -L "$arin_target" ]; then
+        print -u2 -- "IP refresh version appeared during generation; nothing published"
+        return 1
+    fi
+    mkdir -p -- "$config_root/all/mmdb" "$config_root/all/arindb" || return $?
+    mv -- "$ipdb_work/bundle/mmdb" "$geoip_target" || return $?
+    if ! mv -- "$ipdb_work/bundle/arindb" "$arin_target"; then
+        # Restore the still-private first half if the second rename failed.
+        mv -- "$geoip_target" "$ipdb_work/bundle/mmdb" || return $?
+        return 1
+    fi
+    (cd "$config_root" &&
+        git add -- "all/mmdb/$WARP_VERSION" "all/arindb/$WARP_VERSION" &&
+        if ! git diff --cached --quiet -- "all/mmdb/$WARP_VERSION" "all/arindb/$WARP_VERSION"; then
+            git commit -m "${EXTERNAL_WARP_VERSION} GeoLite2 and ARIN databases" -- \
+                "all/mmdb/$WARP_VERSION" "all/arindb/$WARP_VERSION" &&
+            git_push_with_rebase_retry
+        fi) || return $?
+    local update_summary=''
+    if [ -r "$ipdb_work/bundle/update-summary.txt" ]; then
+        update_summary=$(<"$ipdb_work/bundle/update-summary.txt")
+    fi
+    builder_message "GeoLite2 and ARIN databases refreshed for \`${EXTERNAL_WARP_VERSION}\`: ${update_summary:-no update summary}"
+}
+
+refresh_ip_databases
+error_trap 'GeoLite2, ARIN and subscriber evidence release update'
+
+# The config-updater image carries this release's config, so on the deploy
+# path it is built after the Brevo template export below has written its
+# template ids into config/main/onboarding.yml, not here with the other
+# services (built here, the release's config predated that commit).
+#
+# --config_restart=no: the rollout redeploys every block, so each block takes
+# the new config together with its new service version instead of restarting
+# for the config first. warp/config-updater/Makefile writes config-updater.yml
+# into the config version and warpctl's run worker (holdConfigVersion, run.go)
+# holds a block only while its service version is older than the config's; a
+# block whose deploy landed before the config reached its host restarts for it
+# as usual. A run that skips deployment builds the image now, for a rollout
+# run later by hand.
+build_config_updater () {
+    (cd $BUILD_HOME && warpctl build $BUILD_ENV warp/config-updater/Makefile --config_restart=no)
+    error_trap 'warpctl build config-updater'
+    builder_message "service config-updater \`${EXTERNAL_WARP_VERSION}\` available"
+}
+if [ "$WARP_SKIP_DEPLOY" != "" ]; then
+    build_config_updater
+fi
 
 (cd $BUILD_HOME && warpctl build $BUILD_ENV warp/grafana/Makefile)
 error_trap 'warpctl build grafana'
@@ -1587,119 +2894,89 @@ builder_message "service connect \`${EXTERNAL_WARP_VERSION}\` available"
 error_trap 'warpctl build mcp'
 builder_message "service mcp \`${EXTERNAL_WARP_VERSION}\` available"
 
+(cd $BUILD_HOME && warpctl build $BUILD_ENV server${GO_MOD_SUFFIX}/cli/gossip/Makefile)
+error_trap 'warpctl build gossip'
+builder_message "service gossip \`${EXTERNAL_WARP_VERSION}\` available"
+
+(cd $BUILD_HOME && warpctl build $BUILD_ENV server${GO_MOD_SUFFIX}/cli/alt/Makefile)
+error_trap 'warpctl build alt'
+builder_message "service alt \`${EXTERNAL_WARP_VERSION}\` available"
+
 (cd $BUILD_HOME && warpctl build $BUILD_ENV server${GO_MOD_SUFFIX}/cli/proxy/Makefile)
 error_trap 'warpctl build proxy'
 builder_message "service proxy \`${EXTERNAL_WARP_VERSION}\` available"
 
-(cd $BUILD_HOME && warpctl build $BUILD_ENV web/web/Makefile)
+(cd $BUILD_HOME && URNETWORK_ROOT="$BUILD_HOME" WEB_BUILD_CHECKS=0 warpctl build $BUILD_ENV web/web/Makefile)
 error_trap 'warpctl build web'
 builder_message "service web \`${EXTERNAL_WARP_VERSION}\` available"
 
-(cd $BUILD_HOME && warpctl build $BUILD_ENV web/app/Makefile)
-error_trap 'warpctl build web/app'
-builder_message "service web/app \`${EXTERNAL_WARP_VERSION}\` available"
+(cd $BUILD_HOME && warpctl build $BUILD_ENV web/manager/Makefile)
+error_trap 'warpctl build web/manager'
+builder_message "service web/manager \`${EXTERNAL_WARP_VERSION}\` available"
+
+# The manager source directory supplies the deployed `app` service.  warpctl
+# derives an image name from the Makefile directory, so explicitly publish the
+# same verified multi-architecture image under the service name used by the
+# rollout configuration.
+(cd $BUILD_HOME && warpctl import $BUILD_ENV "bringyour/${BUILD_ENV}-manager:${EXTERNAL_WARP_VERSION}" --service_name=app)
+error_trap 'warpctl import manager image as app'
+builder_message "service app \`${EXTERNAL_WARP_VERSION}\` available"
 
 builder_message "release \`${EXTERNAL_WARP_VERSION}\` complete - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"
 
 
 if [ "$WARP_SKIP_DEPLOY" = "" ]; then
-    builder_message "${BUILD_ENV}[0%] services: \`\`\`$(warpctl ls versions $BUILD_ENV --sample)\`\`\`"
+    # Apply the exact Server release's schema and Grafana definitions before
+    # any service can start that release. The LAN runner selects the builder
+    # host's us-fmt settings, so these commands reach Main directly rather than
+    # depending on a developer's loopback SSH forwards. Point it at the binary
+    # already built from server/v<major> above; executing source from another
+    # checkout would break the release/version invariant.
+    BUILD_HOST_GOOS=$(go env GOOS)
+    error_trap 'resolve build host Go OS for Main pre-deploy'
+    BUILD_HOST_GOARCH=$(go env GOARCH)
+    error_trap 'resolve build host Go architecture for Main pre-deploy'
+    MAIN_BRINGYOURCTL_DIR="$BUILD_HOME/server${GO_MOD_SUFFIX}/bringyourctl"
+    MAIN_BRINGYOURCTL_BINARY="$MAIN_BRINGYOURCTL_DIR/build/$BUILD_HOST_GOOS/$BUILD_HOST_GOARCH/bringyourctl"
 
-    # fully deploy the new config before any services
-    # `--percent=XX of the config-updates does not cover all the blocks of `--percent=XX` for other services
-    warpctl deploy $BUILD_ENV config-updater ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] config-updater \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    # fully deploy the new grafana
-    warpctl deploy $BUILD_ENV grafana ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] grafana \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
+    BRINGYOURCTL_BINARY="$MAIN_BRINGYOURCTL_BINARY" \
+        "$MAIN_BRINGYOURCTL_DIR/run-main-lan.sh" db migrate
+    error_trap 'Main database migration before service rollout'
 
-    warpctl deploy $BUILD_ENV lb ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] lb \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV taskworker ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] taskworker \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV api ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] api \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV connect ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] connect \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV web ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] web \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV app ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] app \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV mcp ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] mcp \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV proxy ${WARP_VERSION} --percent=25 --only-older
-    builder_message "${BUILD_ENV}[25%] proxy \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
+    BRINGYOURCTL_BINARY="$MAIN_BRINGYOURCTL_BINARY" \
+        "$MAIN_BRINGYOURCTL_DIR/run-main-lan.sh" grafana load-defaults
+    error_trap 'Main Grafana defaults before service rollout'
 
-    builder_message "${BUILD_ENV}[25%] services: \`\`\`$(warpctl ls versions $BUILD_ENV --sample)\`\`\`"
+    # Export the release's onboarding email templates to Brevo and record their
+    # template ids in config/main/onboarding.yml before the services that send
+    # them roll out. build.sh renders mmm/onboarding/templates per locale from
+    # the localizations store, creates or updates each Brevo transactional
+    # template by name (idempotent, no sends), and write-config merges the ids
+    # into the brevo block of the config file. The key comes from
+    # $WARP_HOME/vault/main/brevo.yml; the builder host's IPs must be on the
+    # Brevo account's authorised-IP list.
+    (cd $WARP_HOME/mmm/onboarding &&
+        npm ci --silent &&
+        ./build.sh upload &&
+        ./build.sh write-config --config "$WARP_HOME/config/main/onboarding.yml")
+    error_trap 'onboarding email templates export to Brevo'
+    (cd $WARP_HOME/config &&
+        git add main/onboarding.yml &&
+        if ! git diff --cached --quiet; then
+            git commit -m "${EXTERNAL_WARP_VERSION} onboarding email templates" &&
+            git_push_with_rebase_retry
+        fi)
+    error_trap 'onboarding templates config push'
 
+    # the release's config, template ids included (see build_config_updater)
+    build_config_updater
 
-    sleep $STAGE_SECONDS
-
-
-    warpctl deploy $BUILD_ENV lb ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] lb \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV taskworker ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] taskworker \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV api ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] api \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV connect ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] connect \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV web ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] web \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV app ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] app \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV mcp ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] mcp \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV proxy ${WARP_VERSION} --percent=50 --only-older
-    builder_message "${BUILD_ENV}[50%] proxy \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-
-    builder_message "${BUILD_ENV}[50%] services: \`\`\`$(warpctl ls versions $BUILD_ENV --sample)\`\`\`"
-
-
-    sleep $STAGE_SECONDS
-
-
-    warpctl deploy $BUILD_ENV lb ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] lb \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV taskworker ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] taskworker \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV api ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] api \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV connect ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] connect \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV web ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] web \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV app ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] app \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV mcp ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] mcp \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV proxy ${WARP_VERSION} --percent=75 --only-older
-    builder_message "${BUILD_ENV}[75%] proxy \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-
-    builder_message "${BUILD_ENV}[75%] services: \`\`\`$(warpctl ls versions $BUILD_ENV --sample)\`\`\`"
-
-
-    sleep $STAGE_SECONDS
-
-
-    warpctl deploy $BUILD_ENV lb ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] lb \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV taskworker ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] taskworker \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV api ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] api \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV connect ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] connect \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV web ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] web \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV app ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] app \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV mcp ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] mcp \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-    warpctl deploy $BUILD_ENV proxy ${WARP_VERSION} --percent=100 --only-older
-    builder_message "${BUILD_ENV}[100%] proxy \`${EXTERNAL_WARP_VERSION}\` deployed (only older)"
-
-    builder_message "${BUILD_ENV}[100%] services: \`\`\`$(warpctl ls versions $BUILD_ENV --sample)\`\`\`"
+    # BUILD_HOME is the build repository root (set from this script's parent
+    # above), so the rollout implementation is directly under all/.
+    source "$BUILD_HOME/all/deploy-rollout.zsh"
+    error_trap 'load warp service rollout'
+    warp_rollout
+    error_trap 'warp service rollout'
 fi
 
 builder_message "Build all \`${EXTERNAL_WARP_VERSION}\` ... done! Enjoy :) - https://github.com/urnetwork/build/releases/tag/v${EXTERNAL_WARP_VERSION}"

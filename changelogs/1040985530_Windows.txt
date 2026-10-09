@@ -1,0 +1,6 @@
+- Regenerate string catalogs for the Pro benefits prompt
+
+Under the hood
+- Rotate saturated provider generations
+- Retire unreliable provider sources safely
+- Bound Reliability provider retirement

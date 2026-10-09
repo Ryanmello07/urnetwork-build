@@ -1,0 +1,6 @@
+- Connect drawer: own the drawer so its gestures and the content's stay apart
+- Connect drawer: opening, closing and scrolling the content are separate gestures
+- Connect drawer: the content is back at the top whenever the drawer closes
+- Connect drawer: the expanded drawer stops two thirds of the way up
+- Connect drawer: keep the sheet's own open behaviour, no fling carry-over
+- Connect drawer: the content continues the fling on its own clock, not after the sheet stops

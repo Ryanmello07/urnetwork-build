@@ -9,7 +9,8 @@
 #   urnetwork-daemon_<version>_<arch>.deb
 #   urnetwork-daemon-<version>-<arch>.install.tar.gz
 #   urnetwork-daemon-<version>.<rpmarch>.rpm  (rpmarch = x86_64|aarch64)
-#   URnetwork-<version>-<arch>.AppImage  (+ .AppImage.zsync)
+#   urnetwork-daemon-<version>-<pkgarch>.pkg.tar.zst  (pkgarch = x86_64|aarch64)
+#   URnetwork-<version>-<arch>.AppImage  (no .zsync)
 #
 # The heavy lifting happens inside the container: build-arch.sh (mounted in)
 # runs the meson build, stages an install tree, and invokes the packaging
@@ -31,12 +32,6 @@
 #                always had it. Unset, NOTHING changes: both halves build in
 #                one invocation exactly as before.
 #
-#                It exists so a CI can run the two halves as separate jobs —
-#                they use different base images (22.04 / 24.04) and the GUI
-#                half is the long pole, so daemon+gui in parallel roughly
-#                halves the per-arch wall clock. See
-#                build/.github/workflows/linux-release.yml.
-#
 #                A role-scoped invocation MUST be given its OWN OUT_DIR: the
 #                stale sweep below clears the WHOLE artifact set, not just this
 #                role's, so `ROLES=daemon ...` followed by `ROLES=gui ...` into
@@ -50,8 +45,10 @@
 #                     `Depends: libc6 (>= x)` in linux/packaging/deb/nfpm.yaml
 #   UR_GLIBC_CEILING  the AppImage's own glibc gate (default: UR_GLIBC_FLOOR)
 #   UR_REQUIRE_RPM    make a missing/failed .rpm fatal (default false: warn and
-#                     carry on, so a bad rpm never costs the release the .deb,
-#                     the tarball or the AppImage — see build-arch.sh's header)
+#                     carry on, so a bad rpm never costs a standalone build
+#                     the .deb, the tarball or the AppImage; run.sh sets it to
+#                     true — see build-arch.sh's header)
+#   UR_REQUIRE_ARCH_PKG  the same for the Arch .pkg.tar.zst (default false)
 #   UR_SKIP_VERIFY=1  build + package only, skip the verification stage
 #
 # SPDX-License-Identifier: MPL-2.0
@@ -116,15 +113,21 @@ fi
 # Clear any stale artifacts of the types we produce, so a partial rebuild can
 # never hand old files to the uploader. (Once per run, NOT per arch — the first
 # arch's output must survive the second arch's pass.)
+# *.flatpak is cleared here even though this script does not build one:
+# all/linux/build-flatpak.sh writes into this same OUT_DIR, it runs AFTER this,
+# and run.sh's upload glob cannot tell a fresh bundle from last release's.
+# *.AppImage.zsync is cleared too although nothing produces one any more: a
+# sidecar left by an older checkout must not ride along to the uploader.
 rm -f "${OUT_DIR}/"*.deb "${OUT_DIR}/"*.install.tar.gz "${OUT_DIR}/"*.rpm \
-    "${OUT_DIR}/"*.pkg.tar.zst \
+    "${OUT_DIR}/"*.pkg.tar.zst "${OUT_DIR}/"*.flatpak \
       "${OUT_DIR}/"*.AppImage "${OUT_DIR}/"*.AppImage.zsync
 
 for arch in ${ARCHES}; do
   for role in ${roles}; do
     echo ">>> building linux ${role} artifacts for ${arch}"
-    # Per-arch, per-role builder image (deps baked in; layer-cached across runs).
+    # Per-arch, per-role builder image, rebuilt from source for every run.
     docker build --platform "linux/${arch}" \
+      --no-cache \
       -f "${here}/Dockerfile.${role}" \
       -t "${image_base}-${role}:${arch}" "${here}"
 
@@ -140,7 +143,7 @@ for arch in ${ARCHES}; do
       -v "${here}/verify.sh:/verify.sh:ro" \
       -e ARCH="${arch}" -e VERSION="${VERSION}" -e ROLE="${role}" \
       -e UR_GLIBC_FLOOR -e UR_GLIBC_CEILING -e UR_SKIP_VERIFY \
-      -e UR_REQUIRE_RPM \
+      -e UR_REQUIRE_RPM -e UR_REQUIRE_ARCH_PKG \
       "${image_base}-${role}:${arch}" \
       bash /build-arch.sh
   done
@@ -161,8 +164,9 @@ for arch in ${ARCHES}; do
     expected="${expected} urnetwork-daemon-${VERSION}-${arch}.install.tar.gz"
   fi
   if have_role gui; then
+    # No .AppImage.zsync: the AppImage embeds no update information; the GUI
+    # updates through its in-app checker (linux/README.md "Updates").
     expected="${expected} URnetwork-${VERSION}-${arch}.AppImage"
-    expected="${expected} URnetwork-${VERSION}-${arch}.AppImage.zsync"
   fi
   for f in ${expected}; do
     if [ ! -f "${OUT_DIR}/${f}" ]; then
@@ -172,12 +176,11 @@ for arch in ${ARCHES}; do
     fi
   done
 
-  # The .rpm is checked separately and NON-FATALLY: it is the one artifact here
-  # that is not (yet) a release contract, and build-arch.sh already tolerates a
-  # failed rpm per-artifact so the four names above survive it. Making it fatal
-  # at this level would undo that — run.sh's uploads all live inside the `then`
-  # branch of one `if build-linux.sh`, so any non-zero exit from this script
-  # skips EVERY linux asset, SDK zip included. Loud, then, rather than fatal.
+  # The .rpm is checked separately, and is fatal only under UR_REQUIRE_RPM=true:
+  # by default build-arch.sh tolerates a failed rpm per artifact so the names
+  # above survive it, and failing here would undo that for a standalone build.
+  # run.sh sets UR_REQUIRE_RPM=true, so a release stops here instead of
+  # shipping without the .rpm.
   case "${arch}" in
     amd64) rpm_arch=x86_64 ;;
     arm64) rpm_arch=aarch64 ;;
@@ -197,10 +200,12 @@ for arch in ${ARCHES}; do
     echo "         UR_REQUIRE_RPM=true makes this fatal instead." >&2
   fi
 
-  # Same treatment for the Arch package, and for the same reason: it is not a
-  # release contract yet, and build-arch.sh already tolerates it per-artifact.
+  # Same treatment for the Arch package under UR_REQUIRE_ARCH_PKG, which run.sh
+  # also sets to true.
   pkg_name="urnetwork-daemon-${VERSION}-${rpm_arch}.pkg.tar.zst"
-  if [ -n "${rpm_arch}" ] && [ -f "${OUT_DIR}/${pkg_name}" ]; then
+  if ! have_role daemon; then
+    : # ROLE=gui only — the Arch package comes out of the daemon container too
+  elif [ -n "${rpm_arch}" ] && [ -f "${OUT_DIR}/${pkg_name}" ]; then
     : # present
   elif [ "${UR_REQUIRE_ARCH_PKG:-false}" = true ]; then
     echo "ERROR: no ${pkg_name} after the ${arch} build and UR_REQUIRE_ARCH_PKG=true" >&2
@@ -217,6 +222,6 @@ done
 echo ">>> linux artifacts built:"
 for f in "${OUT_DIR}"/*.deb "${OUT_DIR}"/*.install.tar.gz "${OUT_DIR}"/*.rpm \
          "${OUT_DIR}"/*.pkg.tar.zst \
-         "${OUT_DIR}"/*.AppImage "${OUT_DIR}"/*.AppImage.zsync; do
+         "${OUT_DIR}"/*.AppImage; do
   if [ -f "$f" ]; then echo "    $(basename "$f")"; fi
 done

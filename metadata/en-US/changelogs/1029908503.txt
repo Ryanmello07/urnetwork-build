@@ -1,0 +1,2 @@
+- Expose provider recovery diagnostics
+- Fix poisoned H1 exit recovery

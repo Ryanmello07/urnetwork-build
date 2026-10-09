@@ -1,0 +1,5 @@
+- Device rpc: add bounded attempt diagnostics
+- Fix dial context cancellation leak
+- Make packet completion accounting behavioral
+- Bound weighted shuffle statistical test runtime
+- Make control family resolver tests deterministic

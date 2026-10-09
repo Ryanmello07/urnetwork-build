@@ -1,0 +1,9 @@
+- Instant account screens read their strings from the store
+- Always show both plans on the Play upgrade picker
+- Make the seed phrase copy button a secondary action
+- Retry the Play offers query and repeat it when the plan picker opens
+- Drop the Widgets row from Settings
+- Label the account switcher's referral rows from the store
+- Open the one Referrals screen from every referral entry point
+- Connect drawer Get Pro opens the upgrade flow
+- Keep the intro funnel from returning after rotation

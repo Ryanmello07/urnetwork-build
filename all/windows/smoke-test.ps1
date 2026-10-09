@@ -1,6 +1,8 @@
 # Smoke test: verify the build image has everything windows/app/build.ps1 needs.
 # Uploaded + run over ssh by setup.sh. Exits 0 if all critical checks pass, else 1.
 # SPDX-License-Identifier: MPL-2.0
+param([Parameter(Mandatory=$true)][string]$ExpectedGoVersion)
+
 $ErrorActionPreference = 'Continue'
 $script:fail = 0
 
@@ -12,6 +14,36 @@ try { $v = (git --version) 2>&1 | Select-Object -First 1; Ok 'git' $v } catch { 
 
 # WiX v5 (dotnet global tool) ------------------------------------------------
 try { $v = (wix --version) 2>&1 | Select-Object -First 1; Ok 'wix' $v } catch { Bad 'wix' 'wix not on PATH (dotnet tool)' }
+
+# CMake (VS component, exported on the machine PATH) -------------------------
+$cmake = Get-Command cmake -ErrorAction SilentlyContinue
+if ($cmake) {
+  $v = (& $cmake.Source --version) 2>&1 | Select-Object -First 1
+  if ($LASTEXITCODE -eq 0 -and $v -match '^cmake version ') {
+    Ok 'cmake' "$v ($($cmake.Source))"
+  } else { Bad 'cmake' "failed to run $($cmake.Source): $v" }
+} else { Bad 'cmake' 'cmake not on PATH (zxing-cpp source build requires it)' }
+
+# Go must match sdk/cgo/go.mod exactly. A stale image otherwise succeeds by
+# downloading another toolchain inside every disposable build overlay.
+$goExe = 'C:\go\bin\go.exe'
+$expectedGo = "go version go$ExpectedGoVersion windows/arm64"
+if (Test-Path $goExe) {
+  $actualGo = (& $goExe version) 2>&1 | Select-Object -First 1
+  if ($LASTEXITCODE -eq 0 -and $actualGo -eq $expectedGo) { Ok 'go' $actualGo }
+  else { Bad 'go' "expected '$expectedGo', got '$actualGo'" }
+} else { Bad 'go' "missing $goExe; expected '$expectedGo'" }
+
+# llvm-mingw target wrappers used by windows/build-sdk.ps1 for both SDK DLLs --
+foreach ($compiler in @('x86_64-w64-mingw32-clang', 'aarch64-w64-mingw32-clang')) {
+  $clang = Get-Command $compiler -ErrorAction SilentlyContinue
+  if ($clang) {
+    $v = (& $clang.Source --version) 2>&1 | Select-Object -First 1
+    if ($LASTEXITCODE -eq 0 -and $v -match '^clang version ') {
+      Ok $compiler "$v ($($clang.Source))"
+    } else { Bad $compiler "failed to run $($clang.Source): $v" }
+  } else { Bad $compiler "$compiler not on PATH (cgo SDK build requires it)" }
+}
 
 # Visual Studio + MSVC cross toolsets (ARM64 native + x64 cross) via vswhere --
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'

@@ -1,16 +1,19 @@
 // Command acceptance drives the locally built Linux or Windows service against
-// main and emits one machine-readable result after every check succeeds.
+// main and preserves completed checks in a machine-readable result on failure.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/urnetwork/build/all/acceptance/authcases"
+	"github.com/urnetwork/build/all/acceptance/testconfig"
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/sdk"
 )
@@ -29,23 +34,36 @@ const (
 
 // Holds validated command-line inputs for one platform campaign.
 type options struct {
-	Credentials    string
-	Fixture        string
-	ActiveClient   string
-	StateDir       string
-	SdkVersion     string
-	AppVersion     string
-	ServiceVersion string
-	Repeat         int
+	Credentials        string
+	Tests              string
+	Fixture            string
+	ActiveClient       string
+	PeerProviderClient string
+	StateDir           string
+	SdkVersion         string
+	AppVersion         string
+	ServiceVersion     string
+	Repeat             int
+
+	ProviderMode            bool
+	ProviderReady           string
+	ProviderStop            string
+	ProviderResult          string
+	ProviderEgressInterface string
+	ProviderEgressIndex     uint
 }
 
 // Records the changed-egress proof from every requested repetition.
 type acceptanceResult struct {
-	Ok          bool     `json:"ok"`
-	Platform    string   `json:"platform"`
-	Repetitions int      `json:"repetitions"`
-	BeforeIps   []string `json:"before_ips"`
-	AfterIps    []string `json:"after_ips"`
+	Ok                   bool               `json:"ok"`
+	Complete             bool               `json:"complete"`
+	Platform             string             `json:"platform"`
+	Repetitions          int                `json:"repetitions"`
+	CompletedRepetitions int                `json:"completed_repetitions"`
+	BeforeIps            []string           `json:"before_ips"`
+	AfterIps             []string           `json:"after_ips"`
+	PeerToPeer           []peerToPeerResult `json:"peer_to_peer"`
+	AuthCases            []authcases.Result `json:"auth_cases"`
 }
 
 // Decodes the common error payload returned by direct cleanup calls.
@@ -53,34 +71,50 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
+// The API surface required to release a client through the NetworkSpace's
+// platform-aware transport rather than a process-global HTTP transport.
+type networkClientRemover interface {
+	RemoveNetworkClientSyncWithContextAndJwt(context.Context, *sdk.RemoveNetworkClientArgs, string) (*sdk.RemoveNetworkClientResult, error)
+}
+
 // Parses the runner inputs and prints only the final result JSON to stdout.
 func main() {
 	var opts options
 	flag.StringVar(&opts.Credentials, "credentials", "", "two-line acceptance credentials file")
+	flag.StringVar(&opts.Tests, "tests", "", "resolved private signup tests JSON")
 	flag.StringVar(&opts.Fixture, "fixture", "", "persistent instant-account secret-key file")
 	flag.StringVar(&opts.ActiveClient, "active-client", "", "private retained client-id file")
+	flag.StringVar(&opts.PeerProviderClient, "peer-provider-client", "", "private controlled peer provider client-id file")
 	flag.StringVar(&opts.StateDir, "state-dir", "", "private SDK state directory")
 	flag.StringVar(&opts.SdkVersion, "sdk-version", "", "SDK build version expected by the daemon")
 	flag.StringVar(&opts.AppVersion, "app-version", "", "locally built app/service version")
 	flag.StringVar(&opts.ServiceVersion, "service-version", "", "version expected from the running service")
 	flag.IntVar(&opts.Repeat, "repeat", 1, "number of complete repetitions")
+	flag.BoolVar(&opts.ProviderMode, "peer-provider", false, "run as the controlled same-platform peer provider")
+	flag.StringVar(&opts.ProviderReady, "peer-provider-ready", "", "private file that receives the provider client id")
+	flag.StringVar(&opts.ProviderStop, "peer-provider-stop", "", "private stop marker watched by the provider")
+	flag.StringVar(&opts.ProviderResult, "peer-provider-result", "", "private provider traffic result JSON")
+	flag.StringVar(&opts.ProviderEgressInterface, "peer-provider-egress-interface", "", "physical interface name used to keep provider sockets outside the client tunnel")
+	flag.UintVar(&opts.ProviderEgressIndex, "peer-provider-egress-index", 0, "physical interface index used to keep provider sockets outside the client tunnel")
 	flag.Parse()
+	if opts.ProviderMode {
+		if err := runPeerProvider(opts); err != nil {
+			fmt.Fprintf(os.Stderr, "acceptance peer provider: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	result, err := run(opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "acceptance: %v\n", err)
-		os.Exit(1)
-	}
-	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
-		fmt.Fprintf(os.Stderr, "acceptance: encode result: %v\n", err)
-		os.Exit(1)
+	if code := writeAcceptanceResult(os.Stdout, os.Stderr, result, err); code != 0 {
+		os.Exit(code)
 	}
 }
 
 // Runs the guest lifecycle and data-plane case for every repetition.
 func run(opts options) (*acceptanceResult, error) {
-	if opts.Credentials == "" || opts.Fixture == "" || opts.ActiveClient == "" || opts.StateDir == "" || opts.SdkVersion == "" || opts.AppVersion == "" || opts.ServiceVersion == "" || opts.Repeat < 1 {
-		return nil, errors.New("credentials, fixture, active-client, state-dir, sdk-version, app-version, service-version, and positive repeat are required")
+	if opts.Credentials == "" || opts.Tests == "" || opts.Fixture == "" || opts.ActiveClient == "" || opts.PeerProviderClient == "" || opts.StateDir == "" || opts.SdkVersion == "" || opts.AppVersion == "" || opts.ServiceVersion == "" || opts.Repeat < 1 {
+		return nil, errors.New("credentials, tests, fixture, active-client, peer-provider-client, state-dir, sdk-version, app-version, service-version, and positive repeat are required")
 	}
 	user, password, err := readCredentials(opts.Credentials)
 	if err != nil {
@@ -92,28 +126,47 @@ func run(opts options) (*acceptanceResult, error) {
 	if err := os.MkdirAll(filepath.Dir(opts.Fixture), 0o700); err != nil {
 		return nil, err
 	}
+	testsConfig, err := testconfig.LoadJSON(opts.Tests)
+	if err != nil {
+		return nil, fmt.Errorf("signup fixture: %w", err)
+	}
+	peerProviderClientId, err := readRetainedClient(opts.PeerProviderClient)
+	if err != nil {
+		return nil, fmt.Errorf("controlled peer provider: %w", err)
+	}
 
 	sdk.Version = opts.SdkVersion
 	result := &acceptanceResult{Ok: false, Platform: runtime.GOOS, Repetitions: opts.Repeat}
+	fmt.Fprintln(os.Stderr, "acceptance: email, phone, Solana, and Bittensor signup/login/delete lifecycles")
+	result.AuthCases = (&authcases.Runner{APIURL: apiUrl, Config: testsConfig}).Run(
+		context.Background(), []string{"email", "phone", "solana", "bittensor"},
+	)
+	if err := reportAuthCases(os.Stderr, result.AuthCases); err != nil {
+		return result, err
+	}
 	for i := 1; i <= opts.Repeat; i++ {
 		fmt.Fprintf(os.Stderr, "acceptance: repetition %d/%d: guest login/logout/secret-key login\n", i, opts.Repeat)
 		if err := guestCredentialLifecycle(opts.Fixture, filepath.Join(opts.StateDir, "guest")); err != nil {
-			return nil, fmt.Errorf("guest credential lifecycle: %w", err)
+			return result, fmt.Errorf("guest credential lifecycle: %w", err)
 		}
-		before, after, err := runTunnelIteration(opts, user, password, i)
+		var peerResult peerToPeerResult
+		before, after, err := runTunnelIteration(opts, user, password, peerProviderClientId, i, &peerResult)
 		if err != nil {
-			return nil, fmt.Errorf("repetition %d: %w", i, err)
+			return result, fmt.Errorf("repetition %d: %w", i, err)
 		}
 		result.BeforeIps = append(result.BeforeIps, before)
 		result.AfterIps = append(result.AfterIps, after)
+		result.PeerToPeer = append(result.PeerToPeer, peerResult)
+		result.CompletedRepetitions++
 	}
 	result.Ok = true
+	result.Complete = true
 	return result, nil
 }
 
 // Runs one password login, provider connection, changed-egress check, and
 // unconditional client cleanup through the installed platform service.
-func runTunnelIteration(opts options, user, password string, iteration int) (beforeIp, afterIp string, returnErr error) {
+func runTunnelIteration(opts options, user, password, peerProviderClientId string, iteration int, peerResult *peerToPeerResult) (beforeIp, afterIp string, returnErr error) {
 	iterationState := filepath.Join(opts.StateDir, fmt.Sprintf("iteration-%d", iteration))
 	if err := os.MkdirAll(iterationState, 0o700); err != nil {
 		return "", "", err
@@ -177,7 +230,7 @@ func runTunnelIteration(opts options, user, password string, iteration int) (bef
 	// Retain the client ID before any tunnel work. A host-side cleanup process
 	// can then release it even if this process or its VM/container is killed.
 	defer func() {
-		clientCleanupErr := removeClient(networkJwt, clientId)
+		clientCleanupErr := removeClient(api, networkJwt, clientId)
 		if clientCleanupErr != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("release network client: %w", clientCleanupErr))
 		} else if err := removeActiveClient(opts.ActiveClient); err != nil {
@@ -233,8 +286,8 @@ func runTunnelIteration(opts options, user, password string, iteration int) (bef
 	if err != nil {
 		return "", "", fmt.Errorf("control hello: %w", err)
 	}
-	if hello.ProtocolVersion != 1 {
-		return "", "", fmt.Errorf("unexpected control protocol %d", hello.ProtocolVersion)
+	if err := validateControlProtocol(runtime.GOOS, hello.ProtocolVersion); err != nil {
+		return "", "", err
 	}
 	if runtime.GOOS == "linux" && hello.SdkVersion != opts.SdkVersion {
 		return "", "", fmt.Errorf("SDK version skew: agent %q daemon %q", opts.SdkVersion, hello.SdkVersion)
@@ -264,71 +317,68 @@ func runTunnelIteration(opts options, user, password string, iteration int) (bef
 		DeviceSpec:        runtime.GOOS + "/" + runtime.GOARCH,
 		AppVersion:        opts.AppVersion,
 	}
-	var rpcMaterial *sdk.DeviceRpcKeyMaterial
-	if runtime.GOOS == "windows" {
-		rpcMaterial, err = sdk.GenerateDeviceRpcKeyMaterial()
-		if err != nil {
-			return "", "", err
-		}
-		config.RpcServerPem = rpcMaterial.GetServerPem()
-		config.RpcClientCertPem = rpcMaterial.GetClientCertPem()
-		config.RpcListenHostPort = "127.0.0.1:12042"
-	}
-
-	callCtx, callCancel = context.WithTimeout(context.Background(), 90*time.Second)
-	started, err := control.Start(callCtx, config)
-	callCancel()
+	rpcMaterial, err := sdk.GenerateDeviceRpcKeyMaterial()
 	if err != nil {
-		return "", "", fmt.Errorf("start tunnel: %w", err)
+		return "", "", err
 	}
-	if started.State != "up" {
-		started, err = waitForTunnelState(control, "up", 30*time.Second)
-		if err != nil {
-			return "", "", fmt.Errorf("tunnel did not reach up: state=%s error=%s: %w", started.State, started.Error, err)
-		}
-	}
-
-	device, err := sdk.NewDeviceRemoteWithDefaults(networkSpace, clientJwt, instanceId)
+	config.RpcSessionId, err = mintRpcSessionId(rand.Reader)
 	if err != nil {
-		return "", "", fmt.Errorf("create device remote: %w", err)
+		return "", "", err
 	}
-	defer device.Close()
-	if runtime.GOOS == "windows" {
+	config.RpcServerPem = rpcMaterial.GetServerPem()
+	config.RpcClientCertPem = rpcMaterial.GetClientCertPem()
+	config.RpcListenHostPort = "127.0.0.1:12042"
+
+	var device *sdk.DeviceRemote
+	var controller *sdk.ConnectViewController
+	defer func() {
+		if controller != nil {
+			device.CloseConnectViewController(controller)
+		}
+		if device != nil {
+			device.Close()
+		}
+	}()
+	afterIp, err = startTunnelAndCheckEgress(context.Background(), runtime.GOOS, control, config, func() error {
+		var err error
+		device, err = sdk.NewDeviceRemoteWithDefaults(networkSpace, clientJwt, instanceId)
+		if err != nil {
+			return fmt.Errorf("create device remote: %w", err)
+		}
 		if err := device.SetRpcServer(
 			rpcMaterial.GetClientPem(),
 			rpcMaterial.GetServerCertPem(),
 			config.RpcListenHostPort,
 		); err != nil {
-			return "", "", fmt.Errorf("configure device RPC: %w", err)
+			return fmt.Errorf("configure device RPC: %w", err)
 		}
-	}
-	if err := waitUntil(60*time.Second, func() bool { return device.GetRemoteConnected() }); err != nil {
-		return "", "", errors.New("device RPC did not connect")
-	}
+		if err := waitUntil(60*time.Second, func() bool { return device.GetRemoteConnected() }); err != nil {
+			return errors.New("device RPC did not connect")
+		}
 
-	controller := device.OpenConnectViewController()
-	defer device.CloseConnectViewController(controller)
-	controller.ConnectBestAvailable()
-	if err := waitUntil(120*time.Second, func() bool {
-		return controller.GetConnectionStatus() == sdk.Connected
-	}); err != nil {
-		return "", "", fmt.Errorf("provider connection: last status %s", controller.GetConnectionStatus())
-	}
-
-	afterIp, err = publicIp()
+		controller = device.OpenConnectViewController()
+		controller.ConnectBestAvailable()
+		if err := waitUntil(120*time.Second, func() bool {
+			return controller.GetConnectionStatus() == sdk.Connected
+		}); err != nil {
+			return fmt.Errorf("provider connection: last status %s", controller.GetConnectionStatus())
+		}
+		return nil
+	}, publicIp)
 	if err != nil {
-		return "", "", fmt.Errorf("network egress: %w", err)
+		return "", "", err
 	}
 	fmt.Fprintf(os.Stderr, "acceptance: network egress %s\n", afterIp)
 	if beforeIp == afterIp {
 		return "", "", errors.New("public IP did not change after provider connection")
 	}
 
-	controller.Disconnect()
-	if err := waitUntil(60*time.Second, func() bool {
-		return controller.GetConnectionStatus() == sdk.Disconnected
-	}); err != nil {
-		return "", "", errors.New("provider did not disconnect")
+	if peerResult == nil {
+		return "", "", errors.New("peer-to-peer result destination is nil")
+	}
+	*peerResult, err = runPeerToPeerClient(device, controller, peerProviderClientId)
+	if err != nil {
+		return "", "", fmt.Errorf("peer-to-peer connection: %w", err)
 	}
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err = control.Stop(stopCtx)
@@ -342,6 +392,15 @@ func runTunnelIteration(opts options, user, password string, iteration int) (bef
 		return "", "", fmt.Errorf("tunnel did not stop: state=%s error=%s: %w", stopped.State, stopped.Error, err)
 	}
 	return beforeIp, afterIp, nil
+}
+
+// Mints the opaque name that binds one RPC key pair to one service session.
+func mintRpcSessionId(random io.Reader) (string, error) {
+	value := make([]byte, 16)
+	if _, err := io.ReadFull(random, value); err != nil {
+		return "", fmt.Errorf("mint device RPC session ID: %w", err)
+	}
+	return hex.EncodeToString(value), nil
 }
 
 // Creates or restores one recoverable account, clears the SDK session, and
@@ -580,12 +639,23 @@ func deleteNetwork(networkJwt string) error {
 }
 
 // Releases the registered production client using its network session.
-func removeClient(networkJwt, clientId string) error {
-	var result struct {
-		Error *apiError `json:"error"`
+func removeClient(remover networkClientRemover, networkJwt, clientId string) error {
+	parsedClientId, err := sdk.ParseId(clientId)
+	if err != nil {
+		return fmt.Errorf("parse client id: %w", err)
 	}
-	if err := postJson("/network/remove-client", map[string]any{"client_id": clientId}, networkJwt, &result); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := remover.RemoveNetworkClientSyncWithContextAndJwt(
+		ctx,
+		&sdk.RemoveNetworkClientArgs{ClientId: parsedClientId},
+		networkJwt,
+	)
+	if err != nil {
 		return err
+	}
+	if result == nil {
+		return errors.New("remove network client returned no result")
 	}
 	if result.Error != nil {
 		if result.Error.Message == "Client does not exist." {
@@ -596,35 +666,58 @@ func removeClient(networkJwt, clientId string) error {
 	return nil
 }
 
-// Reads the host's current public address with keep-alive disabled so the
-// connected request cannot reuse the physical connection.
+var publicIpUrls = []string{
+	"https://checkip.amazonaws.com/",
+	"https://api.ipify.org/",
+}
+
+// Reads the host's current public address through independent endpoints with
+// keep-alive disabled so a connected request cannot reuse a physical socket.
 func publicIp() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://checkip.amazonaws.com", nil)
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
 		},
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
+	return publicIpWithClient(ctx, client, publicIpUrls)
+}
+
+// Attempts every endpoint until one returns a syntactically valid address.
+func publicIpWithClient(ctx context.Context, client *http.Client, urls []string) (string, error) {
+	failures := []string{}
+	for _, url := range urls {
+		ip, err := func() (string, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return "", err
+			}
+			res, err := client.Do(req)
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				return "", fmt.Errorf("HTTP %d", res.StatusCode)
+			}
+			value, err := io.ReadAll(io.LimitReader(res.Body, 256))
+			if err != nil {
+				return "", err
+			}
+			ip := strings.TrimSpace(string(value))
+			if net.ParseIP(ip) == nil {
+				return "", errors.New("invalid public IP response")
+			}
+			return ip, nil
+		}()
+		if err == nil {
+			return ip, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s=%v", url, err))
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", res.StatusCode)
-	}
-	value, err := io.ReadAll(io.LimitReader(res.Body, 256))
-	if err != nil {
-		return "", err
-	}
-	ip := strings.TrimSpace(string(value))
-	if ip == "" {
-		return "", errors.New("empty public IP response")
-	}
-	return ip, nil
+	return "", fmt.Errorf("all public IP endpoints failed: %s", strings.Join(failures, "; "))
 }
 
 // Reads exactly one user line and one password line from the private mount.

@@ -1,0 +1,5 @@
+- Points leaderboard: tab reset and a draggable position indicator
+- Connect drawer: skeleton placeholders for the transport legend and dns status rows
+- Regenerate the localization catalog
+- Final offer page: the welcome-offer eyebrow only with an offer, the yearly card alone; regenerated strings with the escaped percent
+- Sign-up: Periodic product updates opt-out on both create pages, sent as product_updates; store keys for the plan and offer strings

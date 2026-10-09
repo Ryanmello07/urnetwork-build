@@ -1,0 +1,4 @@
+- Add fresh-flow diagnostics and video probe
+
+- Expose fresh-flow provider routing controls
+- Route fresh flows by measured provider quality

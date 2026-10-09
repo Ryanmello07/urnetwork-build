@@ -152,7 +152,6 @@ jobs:
           tarballs=(urnetwork-daemon-*.install.tar.gz)
           debs=(urnetwork-daemon_*.deb)
           appimages=(URnetwork-*.AppImage)
-          zsyncs=(URnetwork-*.AppImage.zsync)
           sdkzips=(URnetworkSdkLinux-*.zip)
           # Binary rpms only. nfpm writes no .src.rpm, but the filter costs a
           # line and an accidental source rpm is not part of the asset set.
@@ -182,7 +181,6 @@ jobs:
           expect_count "install tarballs" "${#tarballs[@]}"  "$n_arch"
           expect_count ".deb"             "${#debs[@]}"      "$n_arch"
           expect_count "AppImages"        "${#appimages[@]}" "$n_arch"
-          expect_count ".zsync"           "${#zsyncs[@]}"    "$n_arch"
           expect_count "SDK zip"          "${#sdkzips[@]}"   1
           if [ "$REQUIRE_RPM" = "true" ]; then
             expect_count ".rpm" "${#rpms[@]}" "$n_arch"
@@ -191,7 +189,7 @@ jobs:
           fi
           # Every asset must carry THIS run's version, or a stale artifact
           # would ride out under a fresh tag.
-          for f in "${tarballs[@]}" "${debs[@]}" "${appimages[@]}" "${zsyncs[@]}" "${sdkzips[@]}"; do
+          for f in "${tarballs[@]}" "${debs[@]}" "${appimages[@]}" "${sdkzips[@]}"; do
             case "$f" in
               *"${VERSION}"*) ;;
               *) echo "::error::$f does not carry version ${VERSION}"; fail=1 ;;
@@ -215,16 +213,14 @@ jobs:
               esac
             done
           done
-          # One AppImage per zsync, one deb per tarball: an arch that built
-          # only half its set must not reach a release.
-          [ "${#appimages[@]}" -eq "${#zsyncs[@]}" ] || { echo "::error::AppImage/zsync count mismatch"; fail=1; }
+          # One deb per tarball: an arch that built only half its set must not
+          # reach a release.
           [ "${#tarballs[@]}" -eq "${#debs[@]}" ]    || { echo "::error::tarball/deb count mismatch"; fail=1; }
           # And each arch must be represented in each family.
           for arch in "${arch_arr[@]}"; do
             for pat in "urnetwork-daemon_${VERSION}_${arch}.deb" \
                        "urnetwork-daemon-${VERSION}-${arch}.install.tar.gz" \
-                       "URnetwork-${VERSION}-${arch}.AppImage" \
-                       "URnetwork-${VERSION}-${arch}.AppImage.zsync"; do
+                       "URnetwork-${VERSION}-${arch}.AppImage"; do
               [ -s "$pat" ] || { echo "::error::missing or empty: $pat"; fail=1; }
             done
           done
@@ -255,7 +251,6 @@ jobs:
             echo "| \`urnetwork-daemon_<version>_<arch>.deb\` | the same service as a native package (Debian/Ubuntu) |"
             echo "| \`urnetwork-daemon-<version>.<rpmarch>.rpm\` | the same service as a native package (Fedora/RHEL/openSUSE) |"
             echo "| \`URnetwork-<version>-<arch>.AppImage\` | the GUI, unprivileged |"
-            echo "| \`URnetwork-<version>-<arch>.AppImage.zsync\` | zsync control file (GitHub answers zsync's range requests with HTTP 501; the working mirror is get.ur.network) |"
             echo "| \`URnetworkSdkLinux-<version>.zip\` | the cgo SDK shared objects + headers, both arches |"
             echo
             echo "The three daemon packages are the SAME payload: one \`meson install --destdir\`"
@@ -285,7 +280,6 @@ jobs:
             urnetwork-daemon-*.install.tar.gz
             urnetwork-daemon_*.deb
             URnetwork-*.AppImage
-            URnetwork-*.AppImage.zsync
             URnetworkSdkLinux-*.zip
           )
           # Appended rather than globbed inline: make-rpm.sh may separate name

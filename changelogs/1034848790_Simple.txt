@@ -1,0 +1,8 @@
+- Set the log verbosity from the developer screen
+- Export a diagnostic bundle from the developer screen
+- Give each process its own glog directory, and carry the old logs into it
+- Do not crash at launch when the log dir cannot be set
+- Fix tunnel recovery after sleep and wake
+- Choose how much the sdk logs, from the diagnostics section
+- Export a diagnostic bundle from the iOS developer menu
+- Share one app group log root between the app and the extension

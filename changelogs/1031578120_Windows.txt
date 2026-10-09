@@ -1,0 +1,3 @@
+- Isolate hosted device sessions and budgets
+- Handle missing DoH route endpoints
+- Harden transport retry and device budgets

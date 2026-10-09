@@ -1,0 +1,3 @@
+- Keep browser device RPC grids stable
+- Points leaderboard view controller: claim the in-flight page in the scope that checks it, drop pages after close, state the goroutine-safety contract
+- Expose contract sender role for lifecycle diagnostics

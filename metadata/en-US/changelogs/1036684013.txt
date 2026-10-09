@@ -1,0 +1,1 @@
+- Dashboard widget: the mark next to the location name is the country color disc

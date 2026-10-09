@@ -81,18 +81,6 @@ func (self *windowsControl) call(ctx context.Context, messageType string, payloa
 	}
 }
 
-// Converts the Windows wire fields into the shared status shape.
-func windowsStatus(reply map[string]any) tunnelStatus {
-	status, _ := reply["status"].(map[string]any)
-	return tunnelStatus{
-		State:            stringValue(status["state"], "stopped"),
-		RpcListenAddress: stringValue(status["rpc_listen_hostport"], ""),
-		ServiceVersion:   stringValue(status["service_version"], ""),
-		ProtocolVersion:  int(numberValue(status["protocol_version"])),
-		Error:            stringValue(status["error"], ""),
-	}
-}
-
 // Reads the installed service version and control protocol.
 func (self *windowsControl) Hello(ctx context.Context, _ string) (tunnelStatus, error) {
 	reply, err := self.call(ctx, "hello", map[string]any{})
@@ -113,19 +101,12 @@ func (self *windowsControl) Status(ctx context.Context) (tunnelStatus, error) {
 
 // Starts the service with the SDK state and temporary device-rpc material.
 func (self *windowsControl) Start(ctx context.Context, config tunnelConfig) (tunnelStatus, error) {
-	reply, err := self.call(ctx, "start_tunnel", map[string]any{
-		"by_jwt":              config.ByJwt,
-		"network_space_json":  config.NetworkSpaceJson,
-		"instance_id":         config.InstanceId,
-		"device_description":  config.DeviceDescription,
-		"device_spec":         config.DeviceSpec,
-		"app_version":         config.AppVersion,
-		"rpc_server_pem":      config.RpcServerPem,
-		"rpc_client_cert_pem": config.RpcClientCertPem,
-		"rpc_listen_hostport": config.RpcListenHostPort,
-		"excluded_app_paths":  []string{},
-		"allowlist_mode":      false,
-	})
+	payload := pinnedStartTunnelPayload(config)
+	payload["device_description"] = config.DeviceDescription
+	payload["device_spec"] = config.DeviceSpec
+	payload["excluded_app_paths"] = []string{}
+	payload["allowlist_mode"] = false
+	reply, err := self.call(ctx, "start_tunnel", payload)
 	if err != nil {
 		return tunnelStatus{}, err
 	}

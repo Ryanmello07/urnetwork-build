@@ -16,10 +16,9 @@ site="$root/mmm/ur.io"
 react="$site/react"
 astro="$site/astro"
 extension="$root/extension"
+localizations="$root/localizations"
+sdk="$root/sdk/js"
 no_sudo=0
-temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-web-setup.XXXXXX")"
-cleanup() { rm -rf "$temporary_root"; }
-trap cleanup EXIT
 
 for arg in "$@"; do
   case "$arg" in
@@ -29,9 +28,27 @@ for arg in "$@"; do
   esac
 done
 
+network_test_gate="$root/tests/network-intensive-suite-lock.sh"
+if [ ! -x "$network_test_gate" ]; then
+  echo "Web setup suite gate is missing or not executable: $network_test_gate" >&2
+  exit 127
+fi
+if [ "${URNETWORK_NETWORK_TEST_LOCK_HELD:-}" != 1 ]; then
+  exec "$network_test_gate" main-acceptance web-setup -- \
+    "$here/setup.sh" "$@"
+fi
+if ! "$network_test_gate" --verify-held main-acceptance; then
+  echo "Web setup inherited an invalid network-intensive lock" >&2
+  exit 70
+fi
+
+temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-web-setup.XXXXXX")"
+cleanup() { rm -rf "$temporary_root"; }
+trap cleanup EXIT
+
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-for command_name in timeout node npm go openssl curl tar zip lsof shasum install; do
+for command_name in timeout node npm go git make openssl curl tar zip lsof shasum install; do
   command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required"
 done
 node -e '
@@ -39,7 +56,7 @@ node -e '
   if (major < 22 || (major === 22 && minor < 12)) process.exit(1);
 ' || die "Node 22.12 or newer is required"
 
-for directory in "$react" "$astro" "$extension"; do
+for directory in "$sdk" "$react" "$astro" "$extension" "$localizations"; do
   [ -f "$directory/package.json" ] || die "missing package at $directory"
   [ -f "$directory/package-lock.json" ] || die "missing package lock at $directory"
 done
@@ -62,7 +79,21 @@ install_dependencies() {
 
 install_dependencies "$react"
 install_dependencies "$astro"
-install_dependencies "$extension"
+# ur.io acceptance uses the sibling SDK, whose canonical package may not yet
+# be published. Build and check that artifact before a private locked install;
+# never populate npm's registry cache with unrelated locally built bytes.
+echo ">>> building and checking the canonical local SDK package"
+(
+  if [ "$(uname -s)" = Darwin ] && [ -z "${DEVELOPER_DIR:-}" ] &&
+      [ -x /Library/Developer/CommandLineTools/usr/bin/make ]; then
+    export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+  fi
+  cd "$sdk"
+  # Make recipes contain multiple commands: propagate an early build failure.
+  timeout 1200 make SHELL='bash -e' package check-package
+)
+timeout 1200 node "$here/install-local-extension-sdk.mjs" "$extension" "$sdk"
+install_dependencies "$localizations"
 
 case "$(uname -s)" in
   Darwin) default_firefox=/Applications/Firefox.app/Contents/MacOS/firefox ;;
@@ -104,109 +135,15 @@ fi
 "$geckodriver_bin" --version | sed -n '1p'
 
 echo ">>> smoke-testing Firefox through geckodriver"
-UR_SETUP_FIREFOX_BIN="$firefox_bin" \
-UR_SETUP_GECKODRIVER_BIN="$geckodriver_bin" \
-timeout 120 node -e '
-  const net = require("node:net");
-  const { once } = require("node:events");
-  const { spawn } = require("node:child_process");
+timeout 120 node "$here/firefox-smoke.mjs" \
+  "$firefox_bin" "$geckodriver_bin" "$react/tests/firefox-process.mjs"
 
-  async function freePort() {
-    const socket = net.createServer();
-    socket.listen(0, "127.0.0.1");
-    await once(socket, "listening");
-    const port = socket.address().port;
-    await new Promise((resolve) => socket.close(resolve));
-    return port;
-  }
-
-  async function command(base, path, options = {}) {
-    const response = await fetch(`${base}${path}`, {
-      ...options,
-      headers: { "content-type": "application/json", ...(options.headers || {}) },
-      signal: AbortSignal.timeout(15_000),
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok || result.value?.error) {
-      throw new Error(result.value?.message || `WebDriver HTTP ${response.status}`);
-    }
-    return result.value;
-  }
-
-  (async () => {
-    const port = await freePort();
-    const base = `http://127.0.0.1:${port}`;
-    const driver = spawn(process.env.UR_SETUP_GECKODRIVER_BIN, ["--port", String(port)], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let diagnostics = "";
-    for (const stream of [driver.stdout, driver.stderr]) {
-      stream.on("data", (chunk) => {
-        diagnostics = (diagnostics + chunk.toString()).slice(-8_000);
-      });
-    }
-
-    let sessionId = "";
-    try {
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        if (driver.exitCode !== null) throw new Error(`geckodriver exited ${driver.exitCode}`);
-        try {
-          const status = await command(base, "/status");
-          if (status?.ready !== undefined) break;
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      if (Date.now() >= deadline) throw new Error("geckodriver did not become ready");
-
-      const session = await command(base, "/session", {
-        method: "POST",
-        body: JSON.stringify({
-          capabilities: {
-            alwaysMatch: {
-              acceptInsecureCerts: true,
-              "moz:firefoxOptions": {
-                binary: process.env.UR_SETUP_FIREFOX_BIN,
-                args: ["-headless"],
-              },
-            },
-          },
-        }),
-      });
-      sessionId = session?.sessionId || "";
-      if (!sessionId) throw new Error("Firefox WebDriver returned no session ID");
-    } catch (error) {
-      throw new Error(`${error.message}${diagnostics ? `\n${diagnostics}` : ""}`);
-    } finally {
-      if (sessionId) {
-        await command(base, `/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
-      }
-      driver.kill("SIGTERM");
-      await Promise.race([
-        once(driver, "exit"),
-        new Promise((resolve) => setTimeout(resolve, 2_000)),
-      ]).catch(() => {});
-      if (driver.exitCode === null) driver.kill("SIGKILL");
-    }
-  })().catch((error) => {
-    console.error(error.message);
-    process.exit(1);
-  });
-'
-
-echo ">>> installing Playwright Chromium"
-(cd "$react" && timeout 1200 npx playwright install chromium)
-echo ">>> smoke-testing Playwright Chromium"
-(cd "$react" && timeout 120 node -e '
-  const { chromium } = require("playwright");
-  (async () => {
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.setContent("<title>URnetwork acceptance setup</title>");
-    if (await page.title() !== "URnetwork acceptance setup") process.exitCode = 1;
-    await browser.close();
-  })().catch((error) => { console.error(error); process.exit(1); });
-')
+echo ">>> installing locked Playwright Chromium and WebKit revisions"
+(cd "$react" && timeout 1200 ./node_modules/.bin/playwright install chromium webkit) ||
+  die "required Chromium/WebKit browser installation failed; web phone/tablet acceptance cannot be omitted"
+echo ">>> smoke-testing Playwright desktop, phone and iPad geometry plus trusted touch"
+(cd "$react" && timeout 120 node tests/browser-surface-smoke.mjs) ||
+  die "required Chromium/WebKit surface smoke failed; inspect the device/touch diagnostics and rerun setup after repair"
 
 tls_dir="$temporary_root/tls"
 mkdir -p "$tls_dir"

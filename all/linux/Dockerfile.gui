@@ -27,7 +27,11 @@ ENV LANG=C.UTF-8
 # Build + packaging toolchain:
 # - meson/g++/GTK stack: what linux/app's meson build needs
 # - squashfs-tools/zsync/desktop-file-utils/patchelf/file: AppDir assembly +
-#   appimagetool helpers (zsyncmake produces the .zsync update feed)
+#   appimagetool helpers. zsyncmake stays installed as one of them, but no
+#   .zsync is produced: the AppImage embeds no update information, and the
+#   GUI's in-app UpdateChecker is the update channel
+# - libsoup-3.0-dev: the in-app updater's HTTP client (linux/app/src/
+#   UpdateChecker.cpp); its TLS comes from glib-networking below
 # - librsvg2-common/gtk-update-icon-cache: svg pixbuf loader + icon cache for
 #   the hand-rolled AppDir (APPIMAGE.md §11e)
 # - libgdk-pixbuf2.0-bin: gdk-pixbuf-query-loaders, which make-appimage.sh
@@ -37,6 +41,8 @@ ENV LANG=C.UTF-8
 # - adwaita-icon-theme: make-appimage.sh hard-fails without /usr/share/icons/Adwaita
 # - libsecret: RPC client credentials live in the desktop's Secret Service;
 #   this is a required security boundary, not an optional plaintext fallback
+# - libzxing-dev: Noble's development package for the upstream zxing-cpp
+#   project; it provides the zxing pkg-config module used by Meson
 # - xvfb/dbus-x11: the headless launch smoke test — a GTK/schema/pixbuf
 #   misconfiguration aborts on startup, and that is exactly what it catches
 # - libfuse2t64: the AppImage's own FUSE runtime, so the launch test exercises
@@ -61,6 +67,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
         libgtkmm-4.0-dev \
         libadwaita-1-dev \
         libsecret-1-dev \
+        libsoup-3.0-dev \
+        libzxing-dev \
         libglib2.0-dev \
         libglib2.0-bin \
         libgdk-pixbuf2.0-bin \

@@ -5,9 +5,31 @@ import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const defaultApiURL = "https://api.bringyour.com";
+const cleanupReports = new WeakMap();
+const cleanupRetryHints = new WeakMap();
+
+function retryAfterSeconds(response) {
+  const header = response.headers?.get?.("retry-after");
+  if (typeof header !== "string") return undefined;
+  const value = header.trim();
+  if (/^\d+$/.test(value)) {
+    const seconds = Number(value);
+    return Number.isSafeInteger(seconds) ? seconds : undefined;
+  }
+  // Accept only a canonical HTTP date, not Date.parse's permissive numeric or
+  // arbitrary-text forms. Retain the derived duration, never the raw header.
+  if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) {
+    return undefined;
+  }
+  const at = Date.parse(value);
+  if (!Number.isFinite(at) || new Date(at).toUTCString() !== value) return undefined;
+  const seconds = Math.max(0, Math.ceil((at - Date.now()) / 1000));
+  return Number.isSafeInteger(seconds) ? seconds : undefined;
+}
 
 async function post(apiURL, route, body, jwt, fetchImpl) {
-  const response = await fetchImpl(`${apiURL}${route}`, {
+  let response;
+  try { response = await fetchImpl(`${apiURL}${route}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -16,10 +38,50 @@ async function post(apiURL, route, body, jwt, fetchImpl) {
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
-  });
+  }); } catch (cause) {
+    // Retain the fixed operation, not the URL, payload or arbitrary fetch text.
+    const error = new Error("cleanup network request failed", { cause });
+    error.route = route;
+    error.name = ["AbortError", "TimeoutError", "TypeError"].includes(cause?.name) ? cause.name : "Error";
+    throw error;
+  }
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`main API ${route} returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`main API ${route} returned HTTP ${response.status}`);
+    error.route = route;
+    error.status = response.status;
+    if (response.status === 429) {
+      const seconds = retryAfterSeconds(response);
+      if (seconds !== undefined) cleanupRetryHints.set(error, seconds);
+    }
+    throw error;
+  }
   return result;
+}
+
+function safeCleanupFailure(error) {
+  const stage = error?.route === "/auth/login-with-password" ? "login" :
+    error?.route === "/network/remove-client" ? "remove-client" :
+      String(error?.message).startsWith("cleanup login") ? "login" :
+        String(error?.message).startsWith("network-client cleanup") ? "remove-client" : "unknown";
+  const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? error.status : null;
+  const knownCodes = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+    "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"];
+  const causes = [error, error?.cause, error?.cause?.cause];
+  const networkCode = causes.map(value => value?.code).find(code => knownCodes.includes(code)) ?? null;
+  const kind = status !== null ? "http-status" : ["AbortError", "TimeoutError"].includes(error?.name) ? "timeout" :
+    error?.name === "TypeError" || networkCode !== null ? "network" : stage !== "unknown" ? "rejected" : "unclassified";
+  const seconds = cleanupRetryHints.get(error);
+  return { stage, kind, status, networkCode,
+    ...(seconds !== undefined ? { retryAfterSeconds: seconds } : {}) };
+}
+
+// The report is formed from allowlisted values at the cleanup boundary. It
+// contains no raw exception text, response body, credentials or client IDs.
+export function cleanupFailureReport(error) {
+  return cleanupReports.get(error) ?? { type: "retained-client-cleanup", schemaVersion: 1, eligible: false,
+    releasedClients: 0, removedMarkers: 0, failedGroups: null, remainingMarkers: null,
+    failures: [safeCleanupFailure(error)] };
 }
 
 export async function releaseClient({
@@ -58,20 +120,143 @@ export function readCredentials(environment = process.env) {
   };
 }
 
-export async function cleanupClientFile(file, environment = process.env, fetchImpl = fetch) {
-  const clientId = fs.readFileSync(file, "utf8").trim();
+function readClientMarker(file) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile()) {
+    throw new Error("acceptance client marker must be a regular file");
+  }
+  const lines = fs.readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length !== 1) {
+    throw new Error("acceptance client marker must contain exactly one non-empty line");
+  }
+  return lines[0];
+}
+
+function cleanupFailureSummary(error) {
+  if (
+    typeof error?.route === "string" &&
+    /^\/[a-z0-9/-]+$/.test(error.route) &&
+    Number.isInteger(error?.status)
+  ) {
+    const seconds = cleanupRetryHints.get(error);
+    return `main API ${error.route} returned HTTP ${error.status}` +
+      (seconds !== undefined ? `; retry after at least ${seconds} seconds` : "");
+  }
+  if (error?.message === "cleanup login returned no network session") {
+    return error.message;
+  }
+  if (String(error?.message).startsWith("cleanup login failed:")) {
+    return "cleanup login rejected";
+  }
+  if (String(error?.message).startsWith("network-client cleanup failed:")) {
+    return "network-client cleanup rejected";
+  }
+  if (["AbortError", "TimeoutError", "TypeError"].includes(error?.name)) {
+    return `cleanup request failed (${error.name})`;
+  }
+  return "cleanup request failed";
+}
+
+export async function cleanupClientFiles(files, environment = process.env, fetchImpl = fetch) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error("at least one acceptance client marker is required");
+  }
+
+  // Read and validate the whole ledger before mutating either API or disk.
+  // Multiple runners can retain aliases for the same client; group them so the
+  // destructive API operation happens exactly once.
+  const markerGroups = new Map();
+  for (const file of files) {
+    const clientId = readClientMarker(file);
+    const aliases = markerGroups.get(clientId) ?? [];
+    aliases.push(file);
+    markerGroups.set(clientId, aliases);
+  }
+
   const { user, password } = readCredentials(environment);
-  await releaseClient({ clientId, user, password, fetchImpl });
-  fs.rmSync(file, { force: true });
+  let releasedClients = 0;
+  let removedMarkers = 0;
+  let remainingMarkers = 0;
+  let deferredGroups = 0;
+  let loginRateLimited = false;
+  const failures = [];
+  for (const [clientId, aliases] of markerGroups) {
+    if (loginRateLimited) {
+      deferredGroups += 1;
+      remainingMarkers += aliases.length;
+      continue;
+    }
+    try {
+      await releaseClient({ clientId, user, password, fetchImpl });
+      for (const file of aliases) {
+        fs.rmSync(file, { force: true });
+        removedMarkers += 1;
+      }
+      releasedClients += 1;
+    } catch (error) {
+      // Every group uses the same credentials. After an auth rate limit, do
+      // not issue another login; retain all remaining aliases for an explicit
+      // later cleanup. Other failures still allow independent group cleanup.
+      failures.push(error);
+      remainingMarkers += aliases.length;
+      loginRateLimited = error?.route === "/auth/login-with-password" && error?.status === 429;
+    }
+  }
+
+  if (failures.length > 0) {
+    const summaries = [...new Set(failures.map(cleanupFailureSummary))];
+    const error = new AggregateError(
+      failures,
+      `${failures.length === 1 ? "one" : failures.length} retained network client group${failures.length === 1 ? "" : "s"} failed cleanup: ${summaries.join("; ")}` +
+        (deferredGroups > 0 ? `; ${deferredGroups} remaining group${deferredGroups === 1 ? "" : "s"} deferred after login rate limit` : ""),
+    );
+    cleanupReports.set(error, { type: "retained-client-cleanup", schemaVersion: 1, eligible: false,
+      releasedClients, removedMarkers, failedGroups: failures.length,
+      ...(deferredGroups > 0 ? { deferredGroups } : {}), remainingMarkers,
+      failures: failures.map(safeCleanupFailure) });
+    throw error;
+  }
+  return { releasedClients, removedMarkers };
+}
+
+export async function cleanupClientFile(file, environment = process.env, fetchImpl = fetch) {
+  const clientId = readClientMarker(file);
+  try {
+    await cleanupClientFiles([file], environment, fetchImpl);
+  } catch (error) {
+    // Preserve the original single-file API's concrete failure for existing
+    // Linux/Windows callers while the multi-file CLI reports grouped failures.
+    if (error instanceof AggregateError && error.errors.length === 1) {
+      throw error.errors[0];
+    }
+    throw error;
+  }
   return clientId;
 }
 
+export async function runCleanupCLI(
+  files,
+  environment = process.env,
+  fetchImpl = fetch,
+  stdout = process.stdout,
+) {
+  const result = await cleanupClientFiles(files, environment, fetchImpl);
+  const clientWord = result.releasedClients === 1 ? "client" : "clients";
+  const markerWord = result.removedMarkers === 1 ? "marker" : "markers";
+  stdout.write(
+    `acceptance: released ${result.releasedClients} retained network ${clientWord} from ${result.removedMarkers} ${markerWord}\n`,
+  );
+  return result;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const file = process.argv[2];
-  if (!file) {
-    console.error("usage: node client-cleanup.mjs <active-client-id-file>");
+  const files = process.argv.slice(2);
+  if (files.length === 0) {
+    console.error("usage: node client-cleanup.mjs <active-client-id-file> [...]");
     process.exit(2);
   }
-  const clientId = await cleanupClientFile(file);
-  console.log(`acceptance: released retained network client ${clientId}`);
+  await runCleanupCLI(files);
 }
