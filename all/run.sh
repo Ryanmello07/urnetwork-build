@@ -501,6 +501,57 @@ sdk_package_stage () {
 export FDROID_VERSION_CODE_OFFSETS="${FDROID_VERSION_CODE_OFFSETS:-0 2 3}"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
 
+# Release branches refer to versioned URnetwork modules by the tag this run has
+# just pushed. Those repositories are private, so neither proxy.golang.org nor
+# sum.golang.org can resolve a new tag anonymously. Keep the authentication
+# setup process-local: tell Go which module namespaces are private and make the
+# HTTPS URLs emitted by Go's VCS resolver use the SSH credentials already
+# required for every build checkout. GIT_CONFIG_COUNT composes with any caller
+# configuration instead of mutating the builder's global git config.
+configure_private_go_modules () {
+    local git_config_count="${GIT_CONFIG_COUNT:-0}"
+    if [[ ! "$git_config_count" =~ '^[0-9]+$' ]]; then
+        echo "GIT_CONFIG_COUNT must be a non-negative integer, got: $git_config_count" >&2
+        return 1
+    fi
+    local setting value namespace key_name value_name found
+    integer index
+    # Preserve caller patterns verbatim, adding only missing exact prefixes.
+    # Reapplying setup must not change the effective Go input sealed earlier.
+    for setting in GOPRIVATE GONOPROXY GONOSUMDB; do
+        value="${(P)setting:-}"
+        for namespace in github.com/urnetwork github.com/urfoundation; do
+            case ",$value," in
+                *",$namespace,"*) ;;
+                *) value="${value:+$value,}$namespace" ;;
+            esac
+        done
+        export "$setting=$value"
+    done
+    for namespace in urnetwork urfoundation; do
+        found=0
+        for (( index=0; index<git_config_count; index++ )); do
+            key_name="GIT_CONFIG_KEY_$index"
+            value_name="GIT_CONFIG_VALUE_$index"
+            if [[ "${(P)key_name:-}" = "url.ssh://git@github.com/$namespace/.insteadOf" &&
+                  "${(P)value_name:-}" = "https://github.com/$namespace/" ]]; then
+                found=1
+                break
+            fi
+        done
+        if (( ! found )); then
+            export "GIT_CONFIG_KEY_${git_config_count}=url.ssh://git@github.com/$namespace/.insteadOf"
+            export "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/$namespace/"
+            (( git_config_count += 1 ))
+        fi
+    done
+    export GIT_CONFIG_COUNT="$git_config_count"
+}
+# Fresh preparation seals these effective settings. Resume must establish the
+# same process-local inputs before ANY validation; never normalize the journal.
+configure_private_go_modules
+error_trap 'private Go module access configuration'
+
 if [[ -n "${BUILD_RESUME:-}" ]]; then
     [[ "$BUILD_RESUME" =~ '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' ]] || exit 64
     export EXTERNAL_WARP_VERSION="$BUILD_RESUME"
@@ -522,36 +573,6 @@ if [[ -n "${BUILD_RESUME:-}" ]]; then
     error_trap 'validate immutable release before resume'
     export PATH="$BUILD_HOME/warp/warpctl/build/darwin/arm64:$PATH"
 fi
-
-
-# Release branches refer to versioned URnetwork modules by the tag this run has
-# just pushed. Those repositories are private, so neither proxy.golang.org nor
-# sum.golang.org can resolve a new tag anonymously. Keep the authentication
-# setup process-local: tell Go which module namespaces are private and make the
-# HTTPS URLs emitted by Go's VCS resolver use the SSH credentials already
-# required for every build checkout. GIT_CONFIG_COUNT composes with any caller
-# configuration instead of mutating the builder's global git config.
-configure_private_go_modules () {
-    local private_go_modules='github.com/urnetwork,github.com/urfoundation'
-    export GOPRIVATE="${GOPRIVATE:+${GOPRIVATE},}${private_go_modules}"
-    export GONOPROXY="${GONOPROXY:+${GONOPROXY},}${private_go_modules}"
-    export GONOSUMDB="${GONOSUMDB:+${GONOSUMDB},}${private_go_modules}"
-
-    local git_config_count="${GIT_CONFIG_COUNT:-0}"
-    if [[ ! "$git_config_count" =~ '^[0-9]+$' ]]; then
-        echo "GIT_CONFIG_COUNT must be a non-negative integer, got: $git_config_count" >&2
-        return 1
-    fi
-    export "GIT_CONFIG_KEY_${git_config_count}=url.ssh://git@github.com/urnetwork/.insteadOf"
-    export "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/urnetwork/"
-    (( git_config_count += 1 ))
-    export "GIT_CONFIG_KEY_${git_config_count}=url.ssh://git@github.com/urfoundation/.insteadOf"
-    export "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/urfoundation/"
-    (( git_config_count += 1 ))
-    export GIT_CONFIG_COUNT="$git_config_count"
-}
-configure_private_go_modules
-error_trap 'private Go module access configuration'
 
 
 # Per-run apple signing keychain (BUILD_APPLE_IDENTITY; see the header note and
@@ -3365,7 +3386,9 @@ builder_message "service web \`${EXTERNAL_WARP_VERSION}\` available"
 # which from $WARP_HOME/mmm is the developer's warp checkout rather than this
 # release's, so a workspace outside both checkouts pins it to the release's
 # warp. mmm's Makefile and ur.io's astro build read WEB_BUILD_CHECKS by that
-# name.
+# name. Preserve the network snapshot generated and checked by the candidate
+# build, then committed and sealed above: live refresh here would change a
+# pinned input after hours of artifact work, just before image publication.
 if release_build image-mmm "$WARP_HOME/.release-checkpoints/$EXTERNAL_WARP_VERSION/image-mmm.json" "$WARP_HOME/mmm/mmm/build/linux" "$WARP_HOME/mmm/mmm/build/darwin"; then
 release_image_publication_begin mmm
 error_trap 'verify unpublished mmm image'
@@ -3376,7 +3399,7 @@ printf 'go %s\n\nuse %s\n\nreplace github.com/urnetwork/warp => %s\n' \
     "$WARP_HOME/mmm/mmm" \
     "$BUILD_HOME/warp" > "$mmm_go_work_dir/go.work"
 error_trap 'mmm go workspace'
-(cd $BUILD_HOME && GOWORK="$mmm_go_work_dir/go.work" URNETWORK_ROOT="$BUILD_HOME" WEB_BUILD_CHECKS=0 warpctl build $BUILD_ENV "$WARP_HOME/mmm/mmm/Makefile")
+(cd $BUILD_HOME && GOWORK="$mmm_go_work_dir/go.work" URNETWORK_ROOT="$BUILD_HOME" WEB_BUILD_CHECKS=0 UR_PRESERVE_NETWORK_STATS=1 warpctl build $BUILD_ENV "$WARP_HOME/mmm/mmm/Makefile")
 error_trap 'warpctl build mmm'
 rm -rf "$mmm_go_work_dir"
 release_verify_mmm

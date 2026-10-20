@@ -37,6 +37,19 @@ The host-tool seal does not make existing container/VM package installations
 fully hermetic (for example F-Droid's buildserver tag/apt inputs). Eligible
 retried non-publishing container stages still execute their original gates.
 
+Private Go module prefixes and Git SSH rewrites are configured process-locally
+before both fresh preparation and the first resume validation. Reapplying this
+setup preserves caller settings and does not append duplicate canonical rules.
+Effective Go input drift still fails validation; setup never changes a seal.
+
+Exact GitHub reconciliation GETs wait on positively identified primary or
+secondary rate limits, honoring reset/Retry-After with at most four attempts
+and a 3700-second total retry budget per request. No extra metadata calls or
+weaker asset checks are used. Authentication failures, ordinary 403s, invalid
+JSON and transport failures stop immediately. This read-only retry does not
+replay draft POSTs or finalization PATCHes, change the account's API allowance,
+or replace the separate upload helper's explicit-rejection policy.
+
 Before candidate sites, on resume and immediately before production mutations,
 read-only preflight checks Main LAN database identity/head/capacity and
 Grafana/Brevo authorization, then invokes Warp's exact deployment guard planner
@@ -44,8 +57,13 @@ with `--preflight`. The early check permits missing future images only; real
 deployments still require them. SQL uses enforced read-only SELECT paths,
 never the potentially mutating `db version` helper. Production probes have a
 300-second overall deadline (the native helper compile is separately bounded
-to 300 seconds) and do not announce, promote, initialize selectors,
-or send messages. Health is checked again later, not assumed to persist.
+to 300 seconds). The native database/Grafana/Brevo gate runs first, then at
+most two services are checked concurrently. Each service retains Warp's exact
+guards, 20 sequential fresh-connection samples per observed block and clean-pass
+retry rules; all 13 services must pass. A failure or deadline cancels and reaps
+the owned probe groups, including registry/status child processes. Probes do
+not announce, promote, initialize selectors, or send messages. Health is
+checked again later, not assumed to persist.
 
 Kernel locking covers the process group, including FD-closing descendants via
 a separate reaper. Detached VMs/daemon containers require cleanup inventory:
@@ -63,13 +81,31 @@ Focused hermetic verification (no provider writes):
 cd build
 GO111MODULE=auto GOMAXPROCS=2 go test -p 1 ./all
 cd all
-python3 -B -m unittest -v test_release_recovery.py test_release_sources.py test_release_entrypoint.py
+python3 -B -m unittest -v test_release_recovery.py test_release_sources.py test_release_entrypoint.py test_release_preflight.py
 ```
 
 The canonical-entrypoint fixture runs unchanged copies of both production
 scripts against real disposable Git/state/cache boundaries and fake host/
-provider commands: a failed mobile SDK stage retries while the passed SDK
-stage is reused. It does not claim an end-to-end real release or deployment.
+provider commands, with genuine read-only `go env` probes: a failed mobile SDK
+stage retries while the passed SDK and all three completed CLI stages are
+reused. Changed effective Go inputs, adjacent source changes and corrupt
+retained outputs still refuse reuse. It does not claim an end-to-end real
+release or deployment.
+
+The final MMM image build sets `UR_PRESERVE_NETWORK_STATS=1` only for that
+command. Candidate checks still refresh and verify the network snapshot before
+it is committed and sealed; the final rebuild consumes those same bytes. The
+cross-repository regression executes the canonical command through a real
+Warpctl, the real nested Makefiles and the real statistics generator, with
+synthetic feed/compiler/package/image boundaries and no provider writes. Run
+from the build repository root:
+
+```sh
+python3 -B all/mmm_release_inputs_test.py --warpctl /path/to/warpctl --mmm /path/to/mmm -v
+```
+
+This fixture requires those inputs explicitly (no skipped coverage) and checks
+candidate refresh, frozen final inputs, and failure gates before publication.
 
 ## Required release components
 
